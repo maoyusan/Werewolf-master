@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    argument: str | None = None
+
+
+_ALIASES = {
+    "开始": "create",
+    "建局": "create",
+    "start": "create",
+    "join": "join",
+    "加入": "join",
+    "参加": "join",
+    "leave": "leave",
+    "退出": "leave",
+    "离开": "leave",
+    "cancel": "cancel",
+    "取消": "cancel",
+    "确认": "confirm",
+    "confirm": "confirm",
+    "重选": "reselect",
+    "重新选择": "reselect",
+    "reselect": "reselect",
+    "status": "status",
+    "状态": "status",
+    "players": "status",
+    "getstatus": "status",
+    "玩家": "status",
+    "玩家列表": "status",
+    "身份": "identity",
+    "角色": "identity",
+    "identity": "identity",
+    "role": "identity",
+    "统计": "stats",
+    "数据": "stats",
+    "stats": "stats",
+    "结算": "result",
+    "结果": "result",
+    "result": "result",
+    "历史": "result",
+    "帮助": "help",
+    "菜单": "help",
+    "help": "help",
+    "ping": "ping",
+    "chatid": "chatid",
+    "changelog": "changelog",
+    "version": "version",
+    "版本": "version",
+    "runinfo": "runinfo",
+    "rolelist": "rolelist",
+    "grouplist": "grouplist",
+    "nextgame": "nextgame",
+    "setlang": "setlang",
+    "getlang": "getlang",
+    "config": "config",
+    "getconfig": "config",
+    "myidles": "myidles",
+    "achv": "achv",
+    "startgame": "create",
+    "开始游戏": "create",
+    "开局": "create",
+    "startchaos": "create_chaos",
+    "混乱开始": "create_chaos",
+    "forcestart": "force_start",
+    "强制开始": "force_start",
+    "立即开始": "force_start",
+    "马上开始": "force_start",
+    "go": "force_start",
+    "flee": "flee",
+    "逃跑": "flee",
+    "extend": "extend",
+    "延长": "extend",
+    "stopwaiting": "stop_waiting",
+    "停止等待": "stop_waiting",
+    "投票": "vote",
+    "vote": "vote",
+    "改票": "change_vote",
+    "重新投票": "change_vote",
+    "change_vote": "change_vote",
+    "狼人": "wolf",
+    "袭击": "wolf",
+    "wolf": "wolf",
+    "查验": "seer",
+    "验人": "seer",
+    "seer": "seer",
+    "守护": "guard",
+    "保护": "guard",
+    "guard": "guard",
+    "访问": "visit",
+    "拜访": "visit",
+    "visit": "visit",
+    "侦查": "detect",
+    "detect": "detect",
+    "转化": "convert",
+    "培养": "convert",
+    "convert": "convert",
+    "模仿": "copy",
+    "复制": "copy",
+    "copy": "copy",
+    "偶像": "idol",
+    "idol": "idol",
+    "恋人": "cupid",
+    "丘比特": "cupid",
+    "cupid": "cupid",
+    "连环杀": "serial_kill",
+    "连环杀人": "serial_kill",
+    "serial_kill": "serial_kill",
+    "猎杀教徒": "hunt_cult",
+    "hunt_cult": "hunt_cult",
+    "猎杀": "hunter_kill",
+    "hunter_kill": "hunter_kill",
+    "开枪": "shoot",
+    "shoot": "shoot",
+    "撒银": "silver",
+    "silver": "silver",
+    "催眠": "sandman",
+    "sandman": "sandman",
+    "捣乱": "trouble",
+    "trouble": "trouble",
+    "和平": "pacifist",
+    "pacifist": "pacifist",
+    "化学": "chemistry",
+    "chemistry": "chemistry",
+    "冻结": "freeze",
+    "freeze": "freeze",
+    "纵火": "douse",
+    "引燃": "ignite",
+    "ignite": "ignite",
+    "burn": "ignite",
+    "douse": "douse",
+    "盗取": "thief",
+    "thief": "thief",
+    "挖掘": "grave",
+    "grave": "grave",
+    "市长": "mayor",
+    "揭示市长": "mayor",
+    "公开市长": "mayor",
+    "mayor": "mayor",
+    "跳过": "skip",
+    "弃票": "abstain",
+    "skip": "skip",
+    # ---- 管理/开发命令（Commands/AdminCommands.cs、Commands/DevCommands.cs）----
+    "smite": "smite",
+    "处决": "smite",
+    "getidles": "getidles",
+    "setlink": "setlink",
+    "remlink": "remlink",
+    "resetlink": "resetlink",
+    "killgame": "killgame",
+    "skipvote": "skipvote",
+    "maintenance": "maintenance",
+    "getroles": "getroles",
+    "playtime": "playtime",
+    "whois": "whois",
+    "user": "user",
+    "getban": "getban",
+    "getbans": "getbans",
+    "permban": "permban",
+    "remban": "remban",
+    "notifyban": "notifyban",
+    "notifyspam": "notifyspam",
+    "preferred": "preferred",
+    "bangroup": "bangroup",
+    "leavegroup": "leavegroup",
+    "addach": "addach",
+    "remach": "remach",
+    "validatelangs": "validatelangs",
+    "broadcast": "broadcast",
+    "winchart": "winchart",
+    "usage": "usage",
+    "checkgroups": "checkgroups",
+    "clearcount": "clearcount",
+    "moveachv": "moveachv",
+    "ohaider": "ohaider",
+    "test": "test",
+    "getcommands": "getcommands",
+    "reloadenglish": "reloadenglish",
+    "fi": "fi",
+}
+
+
+def parse_command(text: str) -> Command:
+    value = (text or "").strip()
+    value = re.sub(r"<@!?[A-Za-z0-9_:-]+>", "", value).strip()
+    value = re.sub(r"^[/！!]", "", value).strip()
+    if not value:
+        return Command("help")
+
+    parts = re.split(r"\s+", value, maxsplit=1)
+    first = parts[0]
+    separator = len(parts) == 2
+    rest = parts[1] if separator else ""
+    key = first.casefold()
+    # `Werewolf Control/UpdateHandler.cs:339-362`：/aboutXxx 走前缀路由，
+    # 在普通指令查表之前处理，命中与否都直接返回。
+    if key.startswith("about"):
+        return Command("about", key)
+    # 中文长指令只有「开始游戏 目标」这种写法会带内部空格，需要单独兜底。
+    if key not in _ALIASES and value.startswith("开始游戏"):
+        key, rest = "开始游戏", value[len("开始游戏") :].strip()
+    name = _ALIASES.get(key)
+    if name is None:
+        return Command("unknown", value)
+    argument = rest.strip(" \t,，") if separator else None
+    return Command(name, argument or None)

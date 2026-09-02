@@ -1,0 +1,299 @@
+{
+  "seed": 1,
+  "clock": "2026-01-01T00:00:00+00:00",
+  "room_id": "win-village",
+  "player_ids": [
+    "u1",
+    "u2",
+    "u3",
+    "u4",
+    "u5"
+  ],
+  "players": [
+    "甲",
+    "乙",
+    "丙",
+    "丁",
+    "戊"
+  ],
+  "operations": [
+    {
+      "kind": "set_roles",
+      "roles": [
+        "Wolf",
+        "Villager",
+        "Villager",
+        "Villager",
+        "Villager"
+      ]
+    },
+    {
+      "kind": "night_action",
+      "actor": "u1",
+      "action": "wolf",
+      "target": "skip"
+    },
+    {
+      "kind": "timeout",
+      "seconds": 60
+    },
+    {
+      "kind": "vote",
+      "actor": "u2",
+      "target": "u1"
+    },
+    {
+      "kind": "vote",
+      "actor": "u3",
+      "target": "u1"
+    },
+    {
+      "kind": "vote",
+      "actor": "u4",
+      "target": "u1"
+    },
+    {
+      "kind": "vote",
+      "actor": "u5",
+      "target": "u1"
+    },
+    {
+      "kind": "vote",
+      "actor": "u1",
+      "target": "u2"
+    },
+    {
+      "kind": "resolve_vote"
+    }
+  ],
+  "expected": {
+    "phase": "finished",
+    "day": 1,
+    "winner": "Village",
+    "winners": [
+      "u2",
+      "u3",
+      "u4",
+      "u5"
+    ],
+    "players": [
+      {
+        "id": "u1",
+        "role": "Wolf",
+        "alive": false,
+        "team": "Wolf",
+        "lover_id": null,
+        "kill_method": "Lynch",
+        "won": false
+      },
+      {
+        "id": "u2",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": true
+      },
+      {
+        "id": "u3",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": true
+      },
+      {
+        "id": "u4",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": true
+      },
+      {
+        "id": "u5",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": true
+      }
+    ],
+    "events": [
+      {
+        "kind": "action_accepted",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {}
+      },
+      {
+        "kind": "no_attack",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "day_started",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "vote_started",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "vote_accepted",
+        "public": false,
+        "target_user_id": "u2",
+        "metadata": {}
+      },
+      {
+        "kind": "vote_accepted",
+        "public": false,
+        "target_user_id": "u3",
+        "metadata": {}
+      },
+      {
+        "kind": "vote_accepted",
+        "public": false,
+        "target_user_id": "u4",
+        "metadata": {}
+      },
+      {
+        "kind": "vote_accepted",
+        "public": false,
+        "target_user_id": "u5",
+        "metadata": {}
+      },
+      {
+        "kind": "vote_accepted",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {}
+      },
+      {
+        "kind": "player_died",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {
+          "user_id": "u1",
+          "method": "Lynch"
+        }
+      },
+      {
+        "kind": "vote_result",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "achievements_unlocked",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {
+          "achievements": [
+            1,
+            10
+          ]
+        }
+      },
+      {
+        "kind": "achievements_unlocked",
+        "public": false,
+        "target_user_id": "u2",
+        "metadata": {
+          "achievements": [
+            1,
+            10
+          ]
+        }
+      },
+      {
+        "kind": "achievements_unlocked",
+        "public": false,
+        "target_user_id": "u3",
+        "metadata": {
+          "achievements": [
+            1,
+            10
+          ]
+        }
+      },
+      {
+        "kind": "achievements_unlocked",
+        "public": false,
+        "target_user_id": "u4",
+        "metadata": {
+          "achievements": [
+            1,
+            10
+          ]
+        }
+      },
+      {
+        "kind": "achievements_unlocked",
+        "public": false,
+        "target_user_id": "u5",
+        "metadata": {
+          "achievements": [
+            1,
+            10
+          ]
+        }
+      },
+      {
+        "kind": "game_finished",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {
+          "winner_teams": [
+            "Village"
+          ]
+        }
+      },
+      {
+        "kind": "game_summary",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "personal_result",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {}
+      },
+      {
+        "kind": "personal_result",
+        "public": false,
+        "target_user_id": "u2",
+        "metadata": {}
+      },
+      {
+        "kind": "personal_result",
+        "public": false,
+        "target_user_id": "u3",
+        "metadata": {}
+      },
+      {
+        "kind": "personal_result",
+        "public": false,
+        "target_user_id": "u4",
+        "metadata": {}
+      },
+      {
+        "kind": "personal_result",
+        "public": false,
+        "target_user_id": "u5",
+        "metadata": {}
+      }
+    ]
+  }
+}

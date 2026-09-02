@@ -1,0 +1,27 @@
+[Unit]
+Description=Werewolf official QQ bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=werewolf
+Group=werewolf
+WorkingDirectory=/opt/werewolf-python
+EnvironmentFile=-/etc/werewolf/werewolf.env
+ExecStartPre=/opt/werewolf-python/.venv/bin/python -m main migrate
+ExecStart=/opt/werewolf-python/.venv/bin/python -m main run
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/werewolf-python /var/log/werewolf
+MemoryMax=512M
+TasksMax=128
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

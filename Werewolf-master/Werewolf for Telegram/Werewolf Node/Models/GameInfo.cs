@@ -1,0 +1,24 @@
+﻿using System;
+using System.Collections.Generic;
+
+namespace Werewolf_Node.Models
+{
+    public class GameInfo
+    {
+        public HashSet<long> Users { get; set; } = new HashSet<long>();  //update this to users alive
+        public long GroupId { get; set; }
+        public string Guid { get; set; }
+        public string Language { get; set; }
+        public string ChatGroup { get; set; }
+        public GameState State { get; set; }
+        public string NodeId { get; set; } = Program.ClientId;
+        public IEnumerable<dynamic> Players { get; set; }
+        public int PlayerCount { get; set; }
+        public Werewolf.GameTime Cycle { get; set; }
+    }
+
+    public enum GameState
+    {
+        Joining, Running, Dead
+    }
+}

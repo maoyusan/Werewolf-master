@@ -1,0 +1,70 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: werewolf
+      POSTGRES_USER: werewolf
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-werewolf-local}
+    volumes:
+      - werewolf-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U werewolf -d werewolf"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ID: ${APP_ID:?请在 .env 中填写 APP_ID}
+      APP_SECRET: ${APP_SECRET:?请在 .env 中填写 APP_SECRET}
+      DATABASE_URL: postgresql://werewolf:${POSTGRES_PASSWORD:-werewolf-local}@db:5432/werewolf
+      HOST: 0.0.0.0
+      PORT: 18100
+      GAME_MODE: ${GAME_MODE:-Normal}
+      DISABLED_ROLES: ${DISABLED_ROLES:-}
+      REQUIRED_ROLES: ${REQUIRED_ROLES:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      DEV_USER_IDS: ${DEV_USER_IDS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MIN_PLAYERS: ${MIN_PLAYERS:-5}
+      JOIN_SECONDS: ${JOIN_SECONDS:-180}
+      NIGHT_SECONDS: ${NIGHT_SECONDS:-90}
+      DAY_SECONDS: ${DAY_SECONDS:-60}
+      VOTE_SECONDS: ${VOTE_SECONDS:-90}
+      ALLOW_FLEE: ${ALLOW_FLEE:-true}
+      ALLOW_EXTEND: ${ALLOW_EXTEND:-false}
+      MAX_EXTEND: ${MAX_EXTEND:-60}
+      RANDOM_LYNCH: ${RANDOM_LYNCH:-false}
+      SECRET_LYNCH: ${SECRET_LYNCH:-false}
+      SECRET_LYNCH_SHOW_VOTES: ${SECRET_LYNCH_SHOW_VOTES:-false}
+      SECRET_LYNCH_SHOW_VOTERS: ${SECRET_LYNCH_SHOW_VOTERS:-false}
+      SHOW_ROLES_ON_DEATH: ${SHOW_ROLES_ON_DEATH:-true}
+      SHOW_ROLES_END: ${SHOW_ROLES_END:-Living}
+      THIEF_FULL: ${THIEF_FULL:-false}
+      ALLOW_ARSONIST: ${ALLOW_ARSONIST:-true}
+      BURNING_OVERKILL: ${BURNING_OVERKILL:-false}
+      RANDOM_MODE: ${RANDOM_MODE:-false}
+      SHOW_IDS: ${SHOW_IDS:-false}
+      SHUFFLE_PLAYER_LIST: ${SHUFFLE_PLAYER_LIST:-false}
+      ALLOW_NSFW: ${ALLOW_NSFW:-false}
+      DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-5}
+      DELIVERY_POLL_SECONDS: ${DELIVERY_POLL_SECONDS:-2}
+    ports:
+      - "127.0.0.1:18100:18100"
+    command: ["/bin/sh", "-c", "python -m main migrate && exec python -m main run"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18100/healthz')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  werewolf-postgres:

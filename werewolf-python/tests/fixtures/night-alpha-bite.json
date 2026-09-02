@@ -1,0 +1,125 @@
+{
+  "seed": 1,
+  "clock": "2026-01-01T00:00:00+00:00",
+  "room_id": "night-alpha-bite",
+  "player_ids": [
+    "u1",
+    "u2",
+    "u3",
+    "u4",
+    "u5"
+  ],
+  "players": [
+    "甲",
+    "乙",
+    "丙",
+    "丁",
+    "戊"
+  ],
+  "rules": {
+    "alpha_wolf_conversion_chance": 100
+  },
+  "operations": [
+    {
+      "kind": "set_roles",
+      "roles": [
+        "AlphaWolf",
+        "Villager",
+        "Villager",
+        "Villager",
+        "Villager"
+      ]
+    },
+    {
+      "kind": "night_action",
+      "actor": "u1",
+      "action": "wolf",
+      "target": "u2"
+    }
+  ],
+  "expected": {
+    "phase": "day",
+    "day": 1,
+    "winner": null,
+    "winners": [],
+    "players": [
+      {
+        "id": "u1",
+        "role": "AlphaWolf",
+        "alive": true,
+        "team": "Wolf",
+        "lover_id": null,
+        "kill_method": null,
+        "won": false
+      },
+      {
+        "id": "u2",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": false
+      },
+      {
+        "id": "u3",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": false
+      },
+      {
+        "id": "u4",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": false
+      },
+      {
+        "id": "u5",
+        "role": "Villager",
+        "alive": true,
+        "team": "Village",
+        "lover_id": null,
+        "kill_method": null,
+        "won": false
+      }
+    ],
+    "events": [
+      {
+        "kind": "action_accepted",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {}
+      },
+      {
+        "kind": "player_bitten_wolves",
+        "public": false,
+        "target_user_id": "u1",
+        "metadata": {}
+      },
+      {
+        "kind": "player_bitten",
+        "public": false,
+        "target_user_id": "u2",
+        "metadata": {}
+      },
+      {
+        "kind": "no_attack",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      },
+      {
+        "kind": "day_started",
+        "public": true,
+        "target_user_id": null,
+        "metadata": {}
+      }
+    ]
+  }
+}
