@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from adapters.qq.adapter import QQBotAdapter
+import pytest
+
+from adapters.qq.adapter import QQBotAdapter, _GROUP_PANEL_ITEMS
 from adapters.qq.events import (
     normalize_c2c_message,
     normalize_channel_message,
@@ -11,9 +14,15 @@ from adapters.qq.events import (
     normalize_group_message,
 )
 from application.commands import parse_command
-from application.contracts import PlatformEvent, PlatformSession, SessionType
+from application.contracts import (
+    NeedsAnchorSendError,
+    PlatformEvent,
+    PlatformSession,
+    SessionType,
+)
 from application.service import GameApplication
-from domain.models import GamePhase, GameRoom, NightAction, Player, Role
+from domain.engine import GameRoomEngine, STALE_TIMEOUT_SECONDS
+from domain.models import DomainEvent, GamePhase, GameRoom, NightAction, Player, Role
 from domain.rules import ruleset_official
 from infrastructure.config import Settings
 from infrastructure.db import DeliveryRecord, PostgreSQLStore
@@ -53,6 +62,9 @@ class InMemoryRoomStore:
     async def get_direct_session(self, _user_id: str) -> None:
         return None
 
+    async def delete_room(self, session_id: str) -> None:
+        self.snapshots.pop(session_id, None)
+
 
 class InMemoryGroupConfigPool:
     """只实现群规则读写所需的数据库接口。"""
@@ -81,7 +93,15 @@ def test_parse_core_and_role_commands() -> None:
     assert parse_command("/投票 3").name == "vote"
     assert parse_command("查验 2").name == "seer"
     assert parse_command("弃票").name == "abstain"
+    assert parse_command("/abstain").name == "abstain"
     assert parse_command("未知指令").name == "unknown"
+
+
+def test_group_panel_names_parse_to_known_commands() -> None:
+    assert 1 <= len(_GROUP_PANEL_ITEMS) <= 20
+    for item in _GROUP_PANEL_ITEMS:
+        parsed = parse_command(item["name"])
+        assert parsed.name != "unknown", item["name"]
 
 
 def test_parse_official_game_start_commands() -> None:
@@ -191,6 +211,46 @@ def test_service_restart_processes_overdue_room_and_skips_finished_room() -> Non
     assert restored is not None and restored.phase == GamePhase.NIGHT
     assert restored.stage_deadline is not None
     assert asyncio.run(store.list_active_rooms()) == [restored]
+
+
+def test_engine_abandon_overdue_uses_timeout_notice() -> None:
+    room = GameRoom(
+        session_id="stale-night",
+        rules=ruleset_official(),
+        phase=GamePhase.NIGHT,
+        day=1,
+        host_user_id="u1",
+        stage_deadline=datetime.now(timezone.utc) - timedelta(seconds=STALE_TIMEOUT_SECONDS + 10),
+        players=[Player("u1", "甲", 1), Player("u2", "乙", 2)],
+    )
+    events = GameRoomEngine().abandon_overdue(room)
+    assert room.phase == GamePhase.CANCELLED
+    assert room.stage_deadline is None
+    assert [event.text for event in events] == ["该局因超时自动解散"]
+
+
+def test_stale_overdue_room_is_abandoned_instead_of_advancing() -> None:
+    overdue = GameRoom(
+        session_id="zombie-night",
+        rules=ruleset_official(),
+        phase=GamePhase.NIGHT,
+        day=1,
+        host_user_id="u1",
+        stage_deadline=datetime.now(timezone.utc) - timedelta(seconds=STALE_TIMEOUT_SECONDS + 5),
+        players=[Player("u1", "甲", 1, role=Role.VILLAGER), Player("u2", "乙", 2, role=Role.WOLF)],
+    )
+    store = InMemoryRoomStore([overdue])
+
+    processed = asyncio.run(GameApplication(store).process_due_rooms())
+
+    assert processed == 1
+    assert asyncio.run(store.get_room("zombie-night")) is None
+    assert asyncio.run(store.list_active_rooms()) == []
+    assert any(
+        "该局因超时自动解散" in getattr(message, "text", "")
+        for _room, messages in store.committed
+        for message in messages
+    )
 
 
 def test_group_rule_config_survives_new_store_instance() -> None:
@@ -364,6 +424,17 @@ def test_creates_official_group_command_panel_once() -> None:
     assert calls[1][0:2] == ("POST", "/v2/panels")
     assert calls[1][2]["json"]["scope"] == "group"
     assert calls[1][2]["json"]["panel"]["items"][0]["name"] == "/startgame"
+    items = calls[1][2]["json"]["panel"]["items"]
+    names = [item["name"] for item in items]
+    for required in ("/link", "/bindqq", "/flee", "/extend"):
+        assert required in names
+    assert "/players" not in names
+    assert len(items) <= 20
+    for item in items:
+        assert item["type"] == "command"
+        assert item["only_admin"] is False
+        assert item["desc"].strip()
+        assert any("\u4e00" <= ch <= "\u9fff" for ch in item["desc"])
 
 
 def test_settings_reject_sqlite_and_missing_secrets(monkeypatch) -> None:
@@ -425,3 +496,201 @@ def test_settings_passes_role_visibility_to_new_rooms(monkeypatch) -> None:
     rules = Settings.from_env().rules
     assert rules.show_roles_on_death is False
     assert rules.show_roles_end == "All"
+
+
+def _c2c_record(**overrides):
+    data = dict(
+        delivery_id="delivery-c2c-1",
+        target_type=SessionType.C2C,
+        target_id="USEROPENID1",
+        text="你的身份是【预言家】。",
+        room_id="group-1",
+        reply_to=None,
+        source_event_id="group-event-1",
+        event_id=None,
+        state_version=1,
+        status="pending",
+        attempts=0,
+        last_error=None,
+        next_attempt_at=None,
+    )
+    data.update(overrides)
+    return DeliveryRecord(**data)
+
+
+def _http_adapter(request_impl):
+    class FakeRoute:
+        def __init__(self, method, path, **parameters):
+            self.method = method
+            self.path = path
+            self.parameters = parameters
+
+    class FakeHttp:
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, route, **kwargs):
+            self.calls.append((route.method, route.path, route.parameters, kwargs))
+            return await request_impl(route, **kwargs)
+
+    class FakeClient:
+        def __init__(self):
+            self.api = type("Api", (), {"_http": FakeHttp()})()
+
+    adapter = QQBotAdapter("12345", "secret-16-chars", object())
+    adapter._client = FakeClient()
+    adapter._route_factory = FakeRoute
+    return adapter
+
+
+def test_c2c_active_payload_omits_null_msg_id() -> None:
+    async def ok(_route, **_kwargs):
+        return {}
+
+    adapter = _http_adapter(ok)
+    asyncio.run(adapter.send_delivery(_c2c_record()))
+    method, path, params, kwargs = adapter.client.api._http.calls[0]
+    assert method == "POST"
+    assert path == "/v2/users/{openid}/messages"
+    assert params["openid"] == "USEROPENID1"
+    payload = kwargs["json"]
+    assert payload["content"].startswith("你的身份是")
+    assert "msg_id" not in payload
+    assert "msg_seq" not in payload
+    assert "event_id" not in payload
+
+
+def test_c2c_passive_payload_keeps_msg_id_and_seq() -> None:
+    async def ok(_route, **_kwargs):
+        return {}
+
+    adapter = _http_adapter(ok)
+    asyncio.run(
+        adapter.send_delivery(_c2c_record(reply_to="c2c-msg-1", event_id="c2c-evt-1", msg_seq=2))
+    )
+    payload = adapter.client.api._http.calls[0][3]["json"]
+    assert payload["msg_id"] == "c2c-msg-1"
+    assert payload["event_id"] == "c2c-evt-1"
+    assert payload["msg_seq"] == 2
+
+
+def test_c2c_no_friend_raises_needs_anchor() -> None:
+    async def boom(_route, **_kwargs):
+        raise RuntimeError("消息发送失败, 无好友关系")
+
+    adapter = _http_adapter(boom)
+    with pytest.raises(NeedsAnchorSendError, match="无好友关系"):
+        asyncio.run(adapter.send_delivery(_c2c_record()))
+
+
+def test_private_message_from_group_does_not_reuse_group_msg_id() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    source = normalize_group_message({
+        "id": "group-msg-1",
+        "event_id": "group-evt-1",
+        "group_openid": "g1",
+        "content": "/go",
+        "timestamp": "2026-09-02T00:00:00+00:00",
+        "author": {"member_openid": "u1", "username": "甲"},
+    })
+    message = asyncio.run(app._private_message("u2", "你的身份是【预言家】。", source))
+    assert message.target.session_type == SessionType.C2C
+    assert message.target.session_id == "u2"
+    assert message.reply_to is None
+    assert message.event_id is None
+
+
+def test_private_message_reuses_recent_c2c_anchor() -> None:
+    class Store(InMemoryRoomStore):
+        async def get_user_reply_anchor(self, user_id):
+            return {
+                "session_type": "c2c",
+                "session_id": user_id,
+                "msg_id": "c2c-msg-9",
+                "event_id": "c2c-evt-9",
+                "uses": 0,
+                "updated_at": datetime.now(timezone.utc),
+            }
+
+        async def note_user_reply_anchor_use(self, _user_id):
+            self.noted = True
+
+    store = Store([])
+    app = GameApplication(store)
+    source = normalize_group_message({
+        "id": "group-msg-1",
+        "event_id": "group-evt-1",
+        "group_openid": "g1",
+        "content": "/go",
+        "timestamp": "2026-09-02T00:00:00+00:00",
+        "author": {"member_openid": "u1", "username": "甲"},
+    })
+    message = asyncio.run(app._private_message("u2", "你的身份是【预言家】。", source))
+    assert message.target.session_type == SessionType.C2C
+    assert message.reply_to == "c2c-msg-9"
+    assert message.event_id == "c2c-evt-9"
+    assert store.noted is True
+
+
+def test_start_from_group_hints_when_private_anchor_missing() -> None:
+    room = GameRoom(
+        session_id="g1",
+        rules=ruleset_official(),
+        phase=GamePhase.NIGHT,
+        day=1,
+        players=[
+            Player("u1", "甲", 1, role=Role.SEER),
+            Player("u2", "乙", 2, role=Role.WOLF),
+        ],
+    )
+    app = GameApplication(InMemoryRoomStore([room]))
+    source = normalize_group_message({
+        "id": "group-msg-1",
+        "event_id": "group-evt-1",
+        "group_openid": "g1",
+        "content": "/go",
+        "timestamp": "2026-09-02T00:00:00+00:00",
+        "author": {"member_openid": "u1", "username": "甲"},
+    })
+    events = [
+        DomainEvent("game_started", "游戏开始。", public=True),
+        DomainEvent("identity", "你的身份是【预言家】。", public=False, target_user_id="u1"),
+    ]
+    messages = asyncio.run(app._events_to_messages(events, room, source))
+    private = [item for item in messages if item.target.session_type == SessionType.C2C]
+    public = [item for item in messages if item.target.session_type == SessionType.GROUP]
+    assert private and all(item.reply_to is None for item in private)
+    assert any("无好友关系" in item.text for item in public)
+
+
+def test_process_deliveries_parks_no_friend_as_waiting() -> None:
+    record = _c2c_record()
+
+    class Store:
+        def __init__(self):
+            self.parked = None
+
+        async def pending_deliveries(self, *args, **kwargs):
+            return [record]
+
+        async def claim_delivery(self, _delivery_id):
+            return record
+
+        async def park_delivery_waiting(self, delivery_id, error):
+            self.parked = (delivery_id, error)
+
+        async def expire_waiting_deliveries(self, *_args, **_kwargs):
+            return 0
+
+        async def purge_finished_deliveries(self, *_args, **_kwargs):
+            return 0
+
+    class Sender:
+        async def send_delivery(self, _record):
+            raise NeedsAnchorSendError("消息发送失败, 无好友关系")
+
+    store = Store()
+    processed = asyncio.run(GameApplication(store).process_deliveries(Sender(), 5))
+    assert processed == 1
+    assert store.parked[0] == record.delivery_id
+    assert "无好友关系" in store.parked[1]

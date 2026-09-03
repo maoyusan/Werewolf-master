@@ -129,6 +129,11 @@ After completing all artifacts, summarize:
 - What's ready: "All artifacts needed for implementation are ready."
 - Prompt: "The artifacts are ready for review. When you are ready, run `$openspec-apply-change (Codex) or /openspec-apply-change (other agents)` or ask me to apply this change."
 
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
+
 **Artifact Creation Guidelines**
 
 - Follow the `instruction` field from `openspec instructions` for each artifact type - it is the authoritative guidance, even for familiar artifact names

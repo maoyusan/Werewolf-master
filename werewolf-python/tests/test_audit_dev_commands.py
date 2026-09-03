@@ -368,7 +368,8 @@ def test_moveachv_requires_a_user_id():
 def test_moveachv_reports_unknown_player():
     app, _ = make_app()
     messages = run(app.handle_event(group_event("/moveachv u404")))
-    assert texts(messages) == ["数据库里找不到玩家 u404。"]
+    # 查无此人时也不回显完整 openid，只给短内部号。
+    assert texts(messages) == ["数据库里找不到玩家 内部号u404。"]
 
 
 def test_moveachv_reports_no_legacy_records():
@@ -376,7 +377,7 @@ def test_moveachv_reports_no_legacy_records():
     app, store = make_app()
     store.players["u1"] = {"user_id": "u1", "name": "甲"}
     messages = run(app.handle_event(group_event("/moveachv u1")))
-    assert texts(messages) == ["玩家 u1 没有可迁移的旧成就记录。"]
+    assert texts(messages) == ["玩家 qq号：内部号u1｜昵称：甲 没有可迁移的旧成就记录。"]
 
 
 # ---------------------------------------------------------------------------

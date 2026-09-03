@@ -496,7 +496,9 @@ def test_whois_known_player():
         "first_seen": NOW, "games": 3, "first_game": NOW,
     }
     text = texts(run(app.handle_event(group_event("/whois u2"))))
-    assert "阿狼" in text and "QQ号：u2" in text
+    # 统一身份格式「qq号：xxx｜昵称：yyy」；没绑定真号时给短内部号，
+    # 不再把完整 openid 原样回显。
+    assert "阿狼" in text and "qq号：" in text and "昵称：" in text
 
 
 def test_notifyban_and_notifyspam_go_to_private():

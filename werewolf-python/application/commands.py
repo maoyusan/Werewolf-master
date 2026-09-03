@@ -62,6 +62,22 @@ _ALIASES = {
     "getconfig": "config",
     "myidles": "myidles",
     "achv": "achv",
+    # QQ 开放平台只给机器人下发 openid，不下发真实 QQ 号，
+    # 玩家名单里要显示「qq号：xxx」就只能靠本人自助绑定。
+    "bindqq": "bind_qq",
+    "绑定qq": "bind_qq",
+    "绑定": "bind_qq",
+    "unbindqq": "unbind_qq",
+    "解绑qq": "unbind_qq",
+    "解绑": "unbind_qq",
+    "whoami": "whoami",
+    "我是谁": "whoami",
+    # QQ 群和单聊会给同一个人两个不同且不可互换的 openid，官方没有换算接口。
+    # /link 是把两者关联起来的一次性握手，关联完成前私聊身份牌根本发不出去。
+    "link": "link",
+    "开通私聊": "link",
+    "私聊": "link",
+    "绑定私聊": "link",
     "startgame": "create",
     "开始游戏": "create",
     "开局": "create",
@@ -144,6 +160,7 @@ _ALIASES = {
     "mayor": "mayor",
     "跳过": "skip",
     "弃票": "abstain",
+    "abstain": "abstain",
     "skip": "skip",
     # ---- 管理/开发命令（Commands/AdminCommands.cs、Commands/DevCommands.cs）----
     "smite": "smite",

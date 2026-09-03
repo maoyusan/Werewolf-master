@@ -1,32 +1,35 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# 注入到每次 openspec instructions 的上下文（约束 AI，不要抄进产物正文）
+context: |
+  本仓库 OpenSpec 规划产物必须使用简体中文。
+  proposal.md / design.md / tasks.md / specs/**/spec.md 的叙述、列表、场景说明全部写中文。
+  禁止用英文写 Why/需求/设计/任务正文；禁止中英混写段落。
+  仅保留 OpenSpec 校验所需的英文结构标题与关键字
+  （Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、
+  Requirement、Scenario、WHEN/THEN/AND、Reason、Migration 等），
+  以及路径、命令名、符号名、测试名、环境变量、kebab-case 目录名。
+  领域：QQ 版狼人杀机器人（werewolf-python）；优先对齐现有 adapters/application/domain 分层。
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - 正文必须简体中文；章节标题保持 schema 要求的英文（Why / What Changes / Capabilities / Impact）
+    - 不要用英文句子描述动机、变更或影响
+  specs:
+    - 需求名称、需求正文、场景名称、WHEN/THEN 叙述必须简体中文
+    - 保留 ## Purpose、## ADDED Requirements、### Requirement:、#### Scenario: 等英文结构标题
+    - 规范词可用「必须/应当」对应 MUST/SHALL，不要整段英文需求
+  design:
+    - 正文必须简体中文；可用中文小标题（背景/目标/非目标/决策/风险/迁移）或保留英文结构标题但正文仍中文
+    - 决策与取舍说明禁止英文段落
+  tasks:
+    - 分组标题与每条 `- [ ]` 任务描述必须简体中文
+    - 验证方式写在同一条任务里，用中文说明
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+operations:
+  apply:
+    guidance:
+      - 实现与提交说明可用中文；tasks.md 勾选进度时不要改写成英文
+  archive:
+    guidance:
+      - 归档写入主 specs 的正文保持简体中文；勿把 delta 译回英文

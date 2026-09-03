@@ -6,12 +6,45 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol
 
-_OPAQUE_USER_ID = re.compile(r"^[0-9A-Fa-f]{32}$")
+_OPAQUE_USER_ID = re.compile(r"^[0-9A-Fa-f]{24,64}$")
+_REAL_QQ_NUMBER = re.compile(r"^[1-9][0-9]{4,14}$")
 
 
 def is_opaque_display_name(name: str) -> bool:
-    """QQ 群消息经常没有昵称，只能拿到 32 位 member_openid。"""
-    return bool(_OPAQUE_USER_ID.fullmatch((name or "").strip()))
+    """判断一个「展示名」能不能直接给玩家看。
+
+    QQ 群消息经常拿不到昵称，归一化层只能退化成 32 位 member_openid 或空串。
+    这两种都必须视为不可展示，否则群里就会出现
+    `607E22D6C8ACB3232D40F1DBF4D11947` 这种内部标识，或者一片空白。
+    """
+    text = (name or "").strip()
+    if not text:
+        return True
+    return bool(_OPAQUE_USER_ID.fullmatch(text))
+
+
+def is_real_qq_number(value: str) -> bool:
+    """QQ 号是 5~15 位、不以 0 开头的纯数字。"""
+    return bool(_REAL_QQ_NUMBER.fullmatch((value or "").strip()))
+
+
+def qq_short_id(user_id: str) -> str:
+    """把内部 openid 压成 8 位短码，只用于人工比对，不再整串外泄。"""
+    text = (user_id or "").strip()
+    if not text:
+        return "未知"
+    return text if len(text) <= 10 else text[:8].upper()
+
+
+def qq_label(user_id: str, qq_number: str | None = None) -> str:
+    """玩家侧展示的 QQ 标识。
+
+    QQ 开放平台只给第三方机器人下发 openid，不下发真实 QQ 号，所以只有玩家
+    自己用 /bindqq 绑定过才拿得到真号；没绑定就退化成 openid 短码。
+    """
+    if qq_number and is_real_qq_number(qq_number):
+        return qq_number.strip()
+    return f"内部号{qq_short_id(user_id)}"
 
 
 class Clock(Protocol):
@@ -400,18 +433,40 @@ class Player:
     seat: int
 
     @property
+    def nickname(self) -> str:
+        """QQ 昵称；取不到时退化成「N号玩家」，绝不外泄内部 openid。"""
+        if is_opaque_display_name(self.display_name):
+            return f"{self.seat}号玩家"
+        return self.display_name.strip()
+
+    @property
     def public_name(self) -> str:
+        """群播报里的称呼：有昵称用昵称，没有就用座位号。"""
         if is_opaque_display_name(self.display_name):
             return f"{self.seat}号"
-        return self.display_name
+        return self.display_name.strip()
+
+    @property
+    def qq_id(self) -> str:
+        """展示用的 QQ 标识：绑定过真号就用真号，否则是 openid 短码。"""
+        return qq_label(self.user_id, self.qq_number)
 
     @property
     def list_label(self) -> str:
+        """名单里的一行：座位号 + QQ 号码 + QQ 昵称，三者齐全才好对人。"""
+        return f"{self.seat}号 qq号：{self.qq_id}｜昵称：{self.nickname}"
+
+    @property
+    def short_label(self) -> str:
+        """空间紧张时的两段式标签（不含 QQ 号）。"""
         if is_opaque_display_name(self.display_name):
             return f"{self.seat}号"
-        return f"{self.seat}号 {self.display_name}"
+        return f"{self.seat}号 {self.display_name.strip()}"
 
     role: Role | None = None
+    # 玩家用 /bindqq 自助绑定的真实 QQ 号。QQ 开放平台不给第三方机器人下发真号，
+    # 没绑定时展示层退化成 openid 短码，绝不整串外泄。
+    qq_number: str | None = None
     alive: bool = True
     original_role: Role | None = None
     lover_id: str | None = None
@@ -603,6 +658,7 @@ class GameRoom:
             Player(
                 user_id=str(item["user_id"]), display_name=str(item["display_name"]),
                 seat=int(item["seat"]), role=Role(item["role"]) if item.get("role") else None,
+                qq_number=(str(item["qq_number"]) if item.get("qq_number") else None),
                 alive=bool(item.get("alive", True)),
                 original_role=Role(item["original_role"]) if item.get("original_role") else None,
                 lover_id=item.get("lover_id"), role_model=item.get("role_model"),

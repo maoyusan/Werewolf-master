@@ -10,6 +10,11 @@ metadata:
   generatedBy: "1.8.0"
 ---
 
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
+
 Enter explore mode. Think deeply. Visualize freely. Follow the conversation wherever it goes.
 
 **IMPORTANT: Explore mode is for thinking, not implementing.** You may read files, search code, and investigate the codebase, but you must NEVER write code or implement features. If the user asks you to implement something, remind them to exit explore mode first and create a change proposal. You MAY create OpenSpec artifacts (proposals, designs, specs) if the user asks—that's capturing thinking, not implementing. For a new change, scaffold it first as described below.
@@ -30,6 +35,11 @@ Enter explore mode. Think deeply. Visualize freely. Follow the conversation wher
 - **Grounded** - Explore the actual codebase when relevant, don't just theorize
 
 ---
+
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
 
 ## What You Might Do
 
@@ -151,6 +161,11 @@ If the user mentions a change or you detect one is relevant:
 
 ---
 
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
+
 ## What You Don't Have To Do
 
 - Follow a script
@@ -265,6 +280,11 @@ You: That changes everything.
 ```
 
 ---
+
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
 
 ## Ending Discovery
 

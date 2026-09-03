@@ -443,6 +443,15 @@ def test_extend_non_numeric_argument_defaults_to_30_seconds():
     assert "30 秒" in texts(messages)
 
 
+def test_bare_extend_replies_with_usage():
+    room = lobby_room(count=5, allow_extend=True)
+    app, _ = make_app(rooms=[room])
+    messages = run(app.handle_event(group_event("/extend", user="u1")))
+    text = texts(messages)
+    assert "/extend" in text
+    assert "30" in text
+
+
 def test_extend_by_admin_not_seated_is_noop():
     room = lobby_room(count=5, allow_extend=False)
     from datetime import datetime, timedelta, timezone
@@ -544,8 +553,7 @@ def test_vote_wrong_phase_rejected():
 def test_abstain_and_skip_record_non_vote():
     """QQ 文字化弃票入口（官方处决无弃票按钮，不投票按闲置计；等价性已在总表 P-008 裁定）。
 
-    注意：中文“弃票/跳过”与 `/vote abstain` 可用；纯 `/abstain` 不在别名表内，
-    会退回“未识别命令 + 指令帮助”（见下一个测试），属提示层差异，记入展示差异。
+    中文「弃票/跳过」、`/vote abstain` 与斜杠 `/abstain` 都记为弃票。
     """
     room = vote_room()
     app, store = make_app(rooms=[room])
@@ -560,14 +568,13 @@ def test_abstain_and_skip_record_non_vote():
     assert store.rooms["g1"].votes["u3"] is None
 
 
-def test_bare_abstain_slash_command_falls_back_to_help():
-    """记录现状：`/abstain` 未映射，回未识别命令帮助（引导可用斜杠指令，不算玩法差异）。"""
+def test_bare_abstain_slash_command_records_non_vote():
+    """`/abstain` 与中文「弃票」同一条路径，投票期记为弃票而不是未识别命令。"""
     room = vote_room()
     app, store = make_app(rooms=[room])
     messages = run(app.handle_event(group_event("/abstain", user="u1")))
-    text = texts(messages)
-    assert "未识别命令" in text and "/startgame" in text
-    assert "u1" not in store.rooms["g1"].votes
+    assert "投票已记录" in texts(messages)
+    assert store.rooms["g1"].votes["u1"] is None
 
 
 def test_change_vote_rejected_like_official():

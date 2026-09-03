@@ -19,6 +19,7 @@ from .models import (
     NightAction,
     Player,
     QuestionType,
+    qq_short_id,
     RandomSource,
     ROLE_ACTIONS,
     DAY_ACTIONS,
@@ -47,6 +48,9 @@ _SKIP = {"", "跳过", "弃权", "弃票", "skip", "abstain", "-1", "0"}
 _YES = {"是", "好", "确认", "yes", "y", "1"}
 # Werewolf.cs:5442-5449 —— HunterFinalShot 用 30 次 1 秒轮询阻塞整局流程。
 _HUNTER_WINDOW_SECONDS = 30
+# 阶段截止后若超过这个秒数仍未推进，视为僵尸局，自动解散而不是继续结算。
+# 普通夜晚/投票只有一两分钟，五分钟还停在原地说明定时器或投递已经卡死。
+STALE_TIMEOUT_SECONDS = 300
 # Werewolf.cs:4917 —— 结算名单 `OrderBy(x => x.Team)` 按 ITeam 声明顺序排，
 # Team 枚举的声明顺序与官方 ITeam 完全一致。
 _TEAM_ORDER = {team: index for index, team in enumerate(Team)}
@@ -467,20 +471,34 @@ class GameRoomEngine:
             show_roles_end="None" if roll < 33 else ("Living" if roll < 67 else "All"),
         )
 
-    def join(self, room: GameRoom, user_id: str, display_name: str) -> list[DomainEvent]:
+    def join(
+        self,
+        room: GameRoom,
+        user_id: str,
+        display_name: str,
+        qq_number: str | None = None,
+    ) -> list[DomainEvent]:
         if room.phase != GamePhase.LOBBY:
             return []
         if any(p.user_id == user_id for p in room.players):
             return []
-        cleaned_name = display_name.replace("\r", "").replace("\n", "").strip()
-        if not cleaned_name or cleaned_name.startswith("/") or cleaned_name.casefold() == "skip":
+        cleaned_name = (display_name or "").replace("\r", "").replace("\n", "").strip()
+        # QQ 群消息大多数情况下根本不下发昵称，空名是常态而不是错误：直接放行，
+        # 展示层会用「N号玩家」兜底。只有明显是误触指令的名字才拦。
+        if cleaned_name.startswith("/") or cleaned_name.casefold() == "skip":
             raise GameRuleError("请先修改为可用的显示名后再加入")
-        if any(p.display_name == cleaned_name for p in room.players):
+        # 重名检测只对真正拿到的昵称生效，否则一群空名玩家会互相判成重名。
+        if cleaned_name and any(p.display_name == cleaned_name for p in room.players):
             raise GameRuleError("当前房间已有相同显示名")
         if len(room.players) >= OFFICIAL_MAX_PLAYERS:
             raise GameRuleError("房间人数已满")
         room.players.append(
-            Player(user_id=user_id, display_name=cleaned_name, seat=len(room.players) + 1)
+            Player(
+                user_id=user_id,
+                display_name=cleaned_name,
+                seat=len(room.players) + 1,
+                qq_number=qq_number,
+            )
         )
         # 建局者可能没有立刻 /join；第一个真正入场的玩家兜底成为房主，
         # 保证 /cancel、/startgame、/go 永远有一个明确的责任人。
@@ -506,8 +524,9 @@ class GameRoomEngine:
         # QQ 群消息经常没有昵称，display_name 会落成 32 位 openid；群里回复已经 @ 了对方，不再把 ID 打进正文。
         shown_name = player.public_name
         # Werewolf.cs:456-459 —— ShowIDs 群设置会在加入播报中附带玩家 ID。
+        # 但整串 openid 属于内部标识，只给 8 位短码用于人工比对。
         if room.rules.show_ids:
-            shown_name = f"{shown_name} (ID: {user_id})"
+            shown_name = f"{shown_name}（内部号{qq_short_id(user_id)}）"
         return [DomainEvent("player_joined", f"{shown_name} 加入游戏，当前 {len(room.players)} 人。{suffix}")]
 
     def _reassign_host(self, room: GameRoom, leaving_user_id: str) -> None:
@@ -653,6 +672,16 @@ class GameRoomEngine:
         room.stage_deadline = None
         room.state_version += 1
         return [DomainEvent("game_removed", "本局已被强制结束并移除。")]
+
+    def abandon_overdue(self, room: GameRoom) -> list[DomainEvent]:
+        """阶段截止后长时间未能推进时强制散局，避免僵尸房间占住群。"""
+
+        if room.phase in {GamePhase.FINISHED, GamePhase.CANCELLED}:
+            return [DomainEvent("abandoned", "该局已经结束。")]
+        room.phase = GamePhase.CANCELLED
+        room.stage_deadline = None
+        room.state_version += 1
+        return [DomainEvent("abandoned", "该局因超时自动解散")]
 
     def extend_time(self, room: GameRoom, user_id: str, seconds: int, *, admin: bool = False) -> list[DomainEvent]:
         if room.phase != GamePhase.LOBBY:
@@ -4444,3 +4473,20 @@ class GameRoomEngine:
 
     def due(self, room: GameRoom, now: datetime | None = None) -> bool:
         return bool(room.stage_deadline and room.stage_deadline <= (now or self._now()))
+
+    def overdue_seconds(self, room: GameRoom, now: datetime | None = None) -> float | None:
+        """距阶段截止已过了多少秒；未到点或没有截止返回 None。"""
+
+        if room.stage_deadline is None:
+            return None
+        deadline = room.stage_deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        elapsed = ((now or self._now()) - deadline).total_seconds()
+        return elapsed if elapsed >= 0 else None
+
+    def is_stale(self, room: GameRoom, now: datetime | None = None) -> bool:
+        """截止后超过宽限期仍停在同一阶段，视为定时器或投递卡死。"""
+
+        overdue = self.overdue_seconds(room, now)
+        return overdue is not None and overdue >= STALE_TIMEOUT_SECONDS

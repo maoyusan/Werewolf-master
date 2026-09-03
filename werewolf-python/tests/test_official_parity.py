@@ -219,15 +219,45 @@ def test_official_duplicate_or_started_join_leaves_room_unchanged() -> None:
     assert room.snapshot() == before_started
 
 
-@pytest.mark.parametrize("display_name", ["", " ", "/命令", " \n/命令 ", "skip", " SKIP "])
+@pytest.mark.parametrize("display_name", ["/命令", " \n/命令 ", "skip", " SKIP "])
 def test_official_lobby_rejects_reserved_join_names(display_name: str) -> None:
-    """Werewolf.cs:708-729：清理后的空名、斜杠开头和 skip 不能加入。"""
+    """Werewolf.cs:708-729：清理后以斜杠开头的名字和 skip 不能加入。"""
     engine, _ = _lobby_engine()
     room = engine.create_room("official-reserved-name", ruleset_official())
 
     with pytest.raises(GameRuleError):
         engine.join(room, "u1", display_name)
     assert room.players == []
+
+
+@pytest.mark.parametrize("display_name", ["", " ", " \n "])
+def test_lobby_accepts_empty_display_name(display_name: str) -> None:
+    """QQ 群消息大多不下发昵称，空名是常态：必须放行，展示层用座位号兜底。
+
+    这一条是本项目相对官方 C# 版的有意偏离——官方运行在 Telegram 上，昵称必定
+    存在；QQ 开放平台只给 openid，把空名当错误会让绝大多数玩家直接进不来。
+    """
+    engine, _ = _lobby_engine()
+    room = engine.create_room("qq-empty-name", ruleset_official())
+
+    engine.join(room, "u1", display_name)
+
+    assert [player.user_id for player in room.players] == ["u1"]
+    assert room.players[0].display_name == ""
+    # 展示层绝不外泄 openid，退化成座位号。
+    assert room.players[0].public_name == "1号"
+    assert room.players[0].nickname == "1号玩家"
+
+
+def test_lobby_allows_multiple_empty_display_names() -> None:
+    """一群拿不到昵称的玩家不能互相判成重名，否则第二个人永远进不来。"""
+    engine, _ = _lobby_engine()
+    room = engine.create_room("qq-empty-name-dup", ruleset_official())
+
+    engine.join(room, "u1", "")
+    engine.join(room, "u2", "")
+
+    assert [player.seat for player in room.players] == [1, 2]
 
 
 def test_official_lobby_rejects_duplicate_display_name() -> None:

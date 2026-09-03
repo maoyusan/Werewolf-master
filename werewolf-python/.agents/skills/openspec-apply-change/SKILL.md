@@ -10,6 +10,11 @@ metadata:
   generatedBy: "1.8.0"
 ---
 
+## 产物语言（强制）
+
+生成或改写的 OpenSpec Markdown 产物（proposal / specs / design / tasks，以及归档主 specs）正文必须全部使用简体中文。禁止英文叙述、禁止中英混写段落。仅允许：OpenSpec 校验强制的英文结构标题与关键字（Why、What Changes、Purpose、ADDED/MODIFIED/REMOVED/RENAMED Requirements、Requirement、Scenario、WHEN/THEN/AND 等）；以及路径、命令名、符号名、测试名、kebab-case 目录名。写完后自检：去掉结构标题与代码标识后应全是中文。
+
+
 Implement tasks from an OpenSpec change.
 
 **Store selection:** If the user names a store (a store is a standalone OpenSpec repo registered on this machine) or the work lives in one, run `openspec store list --json` to discover registered store ids, then pass `--store <id>` on the commands that read or write specs and changes (`new change`, `status`, `instructions`, `list`, `show`, `validate`, `archive`, `doctor`, `context`, `view`). Once selected, treat `--store <id>` as sticky for the rest of the workflow. Every unscoped example of those commands below is shorthand: before running it, append the flag. For example, run `openspec status --change "<name>" --json --store "<id>"`, not the unscoped form shown below. Other commands do not take the flag. Hints printed by commands already carry the flag; keep it on follow-ups. Without a store, commands act on the nearest local `openspec/` root.
