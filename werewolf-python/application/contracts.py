@@ -51,6 +51,8 @@ class PlatformEvent:
     # NapCat/OneBot 下的群角色：owner / admin / member。私聊事件为 None。
     # 用来判断发起人是不是群主群管，也用来判断机器人自己有没有改名片的权限。
     group_role: str | None = None
+    # 群消息是否明确 @ 了机器人；普通聊天不得进入指令分发。
+    is_bot_mentioned: bool = False
 
 
 @dataclass(frozen=True)

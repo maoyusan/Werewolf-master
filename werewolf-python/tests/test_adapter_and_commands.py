@@ -21,7 +21,7 @@ from application.contracts import (
 )
 from application.service import GameApplication
 from domain.engine import GameRoomEngine, STALE_TIMEOUT_SECONDS
-from domain.models import DomainEvent, GamePhase, GameRoom, NightAction, Player, Role
+from domain.models import DomainEvent, GamePhase, GameRoom, NightAction, Player, Role, Team
 from domain.rules import GameRuleError, ruleset_official
 from infrastructure.config import Settings
 from infrastructure.db import DeliveryRecord, PostgreSQLStore
@@ -362,6 +362,52 @@ def test_normalize_group_message_drops_at_segments() -> None:
     assert message_text({"message": "[CQ:at,qq=10000] /join"}) == "/join"
 
 
+def test_normalize_group_message_recognizes_only_the_bot_mention() -> None:
+    segment_payload = _group_payload(
+        "加入",
+        self_id=10000,
+        message=[
+            {"type": "at", "data": {"qq": "10000"}},
+            {"type": "text", "data": {"text": " 加入"}},
+        ],
+    )
+    string_payload = _group_payload(
+        "[CQ:at,qq=10000] 加入",
+        self_id=10000,
+        message="[CQ:at,qq=10000] 加入",
+    )
+    other_payload = _group_payload(
+        "加入",
+        self_id=10000,
+        message=[
+            {"type": "at", "data": {"qq": "10009"}},
+            {"type": "text", "data": {"text": " 加入"}},
+        ],
+    )
+    assert normalize_group_message(segment_payload).is_bot_mentioned is True
+    assert normalize_group_message(string_payload).is_bot_mentioned is True
+    assert normalize_group_message(other_payload).is_bot_mentioned is False
+
+
+def test_group_plain_chat_is_ignored_but_slash_or_bot_mention_is_dispatched() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    plain = normalize_group_message(_group_payload("今晚吃什么", message_id=1101))
+    slash = normalize_group_message(_group_payload("/join", message_id=1102))
+    mentioned = normalize_group_message(
+        _group_payload(
+            "加入", message_id=1103, self_id=10000,
+            message=[
+                {"type": "at", "data": {"qq": "10000"}},
+                {"type": "text", "data": {"text": " 加入"}},
+            ],
+        )
+    )
+
+    assert asyncio.run(app.handle_event(plain)) == []
+    assert "/startgame" in asyncio.run(app.handle_event(slash))[0].text
+    assert "/startgame" in asyncio.run(app.handle_event(mentioned))[0].text
+
+
 def test_normalize_private_message_session_is_the_qq_number() -> None:
     event = normalize_private_message({
         "post_type": "message",
@@ -532,8 +578,53 @@ def test_identity_delivery_needs_no_binding_hint() -> None:
     private = [item for item in messages if item.target.session_type == SessionType.C2C]
     public = [item for item in messages if item.target.session_type == SessionType.GROUP]
     assert [item.target.session_id for item in private] == ["10001"]
+    assert "当前座位：1号(甲)" in private[0].text
+    assert "玩家：1号(甲)、2号(乙)" in private[0].text
     # 不再有「无好友关系」「先私聊 /link」这类绑定引导。
     assert not any("好友" in item.text or "绑定" in item.text for item in public)
+
+
+def test_duplicate_join_reports_the_requested_message() -> None:
+    room = GameRoom(
+        session_id="20001", rules=ruleset_official(), phase=GamePhase.LOBBY,
+        players=[Player("10001", "甲", 1)],
+    )
+    with pytest.raises(GameRuleError, match="你已加入对局，无法重复加入"):
+        GameRoomEngine().join(room, "10001", "甲")
+
+
+def test_vote_details_keep_voter_target_and_seat_mapping() -> None:
+    room = GameRoom(
+        session_id="20001", rules=ruleset_official(), phase=GamePhase.VOTE,
+        players=[
+            Player("u1", "甲", 1, role=Role.VILLAGER),
+            Player("u2", "乙", 2, role=Role.WOLF),
+            Player("u3", "沐年", 3, role=Role.VILLAGER),
+            Player("u4", "丙", 4, role=Role.VILLAGER),
+            Player("u5", "丁", 5, role=Role.VILLAGER),
+        ],
+    )
+    room.votes = {"u1": "u2", "u3": "u4", "u4": "u4", "u5": "u4", "u2": "u1"}
+    events = GameRoomEngine().resolve_vote(room)
+    details = next(event.text for event in events if event.kind == "vote_details")
+
+    assert "3号(沐年) 投票 4号(丙)" in details
+    assert "4号(丙) 已获得：3票" in details
+    assert room.players[3].alive is False
+    assert room.players[1].alive is True
+
+
+def test_finish_always_reveals_every_role_and_team() -> None:
+    room = GameRoom(
+        session_id="20001", rules=ruleset_official(), phase=GamePhase.DAY,
+        players=[
+            Player("u1", "甲", 1, role=Role.SEER),
+            Player("u2", "乙", 2, role=Role.WOLF, alive=False),
+        ],
+    )
+    summary = next(event.text for event in GameRoomEngine().finish(room, Team.VILLAGE) if event.kind == "game_summary")
+    assert "1号(甲)" in summary and "先知" in summary and "村民阵营" in summary
+    assert "2号(乙)" in summary and "狼人" in summary and "狼人阵营" in summary
 
 
 def test_sync_cards_numbers_the_living_and_marks_the_dead() -> None:

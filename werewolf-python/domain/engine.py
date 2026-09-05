@@ -476,7 +476,7 @@ class GameRoomEngine:
         if room.phase != GamePhase.LOBBY:
             return []
         if any(p.user_id == user_id for p in room.players):
-            return []
+            raise GameRuleError("你已加入对局，无法重复加入")
         cleaned_name = (display_name or "").replace("\r", "").replace("\n", "").strip()
         # QQ 群消息大多数情况下根本不下发昵称，空名是常态而不是错误：直接放行，
         # 展示层会用「N号玩家」兜底。只有明显是误触指令的名字才拦。
@@ -813,7 +813,9 @@ class GameRoomEngine:
                 f"你的身份：{role_display_name(shown) if shown else '未知'}"
                 f"｜阵营：{self._team_text(shown_team) if shown_team else '未知'}",
                 f"目标：{self._team_goal(shown_team)}",
-                f"操作：{self._role_help(shown)}",
+                f"技能：{self._role_help(shown)}",
+                f"能力说明：{self._role_help(shown)}",
+                "使用条件与基本玩法：按上述技能说明，在对应阶段私聊机器人发送指令；没有可用技能时参与讨论和投票。",
             ]
             lines.extend(extras)
             events.append(
@@ -3866,14 +3868,18 @@ class GameRoomEngine:
         # Werewolf.cs:1125-1151 —— 领域层保留官方的投票确认契约：
         # 确认发给投票者本人，由平台适配层决定是否同时在群里播报。
         choice = room.votes.get(user_id)
+        def vote_label(player: Player | None) -> str:
+            if player is None:
+                return "-"
+            nickname = player.nickname if player.display_name.strip() and not is_opaque_display_name(player.display_name) else "-"
+            return f"{player.seat}号({nickname})"
         if room.rules.secret_lynch:
-            text = f"{voter.short_label} 投票了，总计 {len(room.votes)} 票。"
+            text = f"{vote_label(voter)} 已投票，总计 {len(room.votes)} 票。"
         elif choice is None:
-            text = f"{voter.short_label} 选择弃票。"
+            text = f"{vote_label(voter)} 选择弃票。"
         else:
             chosen = next((p for p in room.players if p.user_id == choice), None)
-            name = chosen.short_label if chosen else "未知玩家"
-            text = f"{voter.short_label} 投票将 {name} 处死。"
+            text = f"{vote_label(voter)} 投票 {vote_label(chosen)}。"
         events = [DomainEvent(
             "vote_accepted", text, public=False, target_user_id=voter.user_id,
         )]
@@ -3928,7 +3934,10 @@ class GameRoomEngine:
             for player in self._players(room):
                 if room.votes.get(player.user_id):
                     player.non_vote_count = 0
-        for voter_id, target_id in room.votes.items():
+        for voter_id, target_id in sorted(
+            room.votes.items(),
+            key=lambda item: next((p.seat for p in room.players if p.user_id == item[0]), 10**9),
+        ):
             voter = next((player for player in room.players if player.user_id == voter_id), None)
             if not voter or not voter.alive or not target_id:
                 continue
@@ -3941,11 +3950,40 @@ class GameRoomEngine:
                 "user_id": voter.user_id,
                 "weight": weight,
             })
-        for target_id, count in counts.items():
+        for target_id, count in sorted(
+            counts.items(),
+            key=lambda item: next((p.seat for p in room.players if p.user_id == item[0]), 10**9),
+        ):
             target = next((player for player in room.players if player.user_id == target_id), None)
             if target:
                 target.votes_received = count
         eliminated: list[Player] = []
+        def vote_label(player: Player | None) -> str:
+            if player is None:
+                return "-"
+            nickname = player.nickname if player.display_name.strip() and not is_opaque_display_name(player.display_name) else "-"
+            return f"{player.seat}号({nickname})"
+        vote_lines: list[str] = []
+        for voter_id, target_id in sorted(
+            room.votes.items(),
+            key=lambda item: next((p.seat for p in room.players if p.user_id == item[0]), 10**9),
+        ):
+            voter = next((p for p in room.players if p.user_id == voter_id), None)
+            if voter is None:
+                continue
+            target = next((p for p in room.players if p.user_id == target_id), None) if target_id else None
+            voter_label = vote_label(voter)
+            target_label = vote_label(target)
+            vote_lines.append(f"{voter_label} 投票 {target_label}" if target else f"{voter_label} 弃票")
+        for target_id, count in sorted(
+            counts.items(),
+            key=lambda item: next((p.seat for p in room.players if p.user_id == item[0]), 10**9),
+        ):
+            target = next((p for p in room.players if p.user_id == target_id), None)
+            if target is not None:
+                vote_lines.append(f"{vote_label(target)} 已获得：{count}票")
+        if vote_lines:
+            events.append(DomainEvent("vote_details", "投票明细：\n" + "\n".join(vote_lines)))
         if counts:
             maximum = max(counts.values())
             candidates = [key for key, value in counts.items() if value == maximum]
@@ -4030,7 +4068,7 @@ class GameRoomEngine:
             events.extend(self._kill(
                 room, target, KillMethod.LYNCH, killers=lynch_killers, is_night=False,
             ))
-            events.append(DomainEvent("vote_result", f"{self._name(target)}出局。"))
+            events.append(DomainEvent("vote_result", f"{self._name(target)} 本轮出局。"))
             # Werewolf.cs:2771-2773 —— 击杀后统计剩余存活者是否全票投给了替罪羊。
             if target.role == Role.TANNER:
                 alive_rest = self._players(room)
@@ -4232,7 +4270,7 @@ class GameRoomEngine:
             self._win_announcement(room, winners),
             metadata={"winner_teams": [team.value for team in winners]},
         ))
-        events.append(DomainEvent("game_summary", self._end_roster(room)))
+        events.append(DomainEvent("game_summary", self._end_roster_all(room)))
         events.extend(
             DomainEvent(
                 "personal_result",
@@ -4243,6 +4281,16 @@ class GameRoomEngine:
             for p in room.players
         )
         return events
+
+    def _end_roster_all(self, room: GameRoom) -> str:
+        """终局固定公开所有玩家的座位、昵称、身份和阵营。"""
+        lines = [f"终局身份揭示（存活 {sum(p.alive for p in room.players)}/{len(room.players)}）："]
+        for player in sorted(room.players, key=lambda p: p.seat):
+            role = role_display_name(player.role) if player.role else "未知"
+            team = self._team_text(player.team) if player.team else "未知阵营"
+            nickname = player.nickname if player.display_name.strip() and not is_opaque_display_name(player.display_name) else "-"
+            lines.append(f"{player.seat}号({nickname})：{role}，{team}，{'存活' if player.alive else '出局'}")
+        return "\n".join(lines)
 
     def _win_announcement(self, room: GameRoom, winners: tuple[Team, ...]) -> str:
         """Werewolf.cs:4770-4901 —— DoGameEnd 中每个获胜队伍对应的公开胜利文案。"""

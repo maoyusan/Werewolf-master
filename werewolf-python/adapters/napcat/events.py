@@ -34,8 +34,8 @@ def _parse_time(value: Any) -> datetime:
 def _segments_text(message: Any) -> str:
     """把 OneBot 的消息段数组拼成纯文本。
 
-    只保留 text 段：at 段一律丢弃。NapCat 版不再要求玩家 @Bot 才能触发指令，
-    需要指定目标的指令统一用座位号，不依赖 @ 谁。
+    只保留 text 段：at 段一律丢弃。是否 @Bot 由归一化结果中的
+    ``is_bot_mentioned`` 单独记录，应用层据此决定群消息是否进入指令处理。
     """
     if isinstance(message, str):
         return _CQ_CODE.sub(" ", message)
@@ -88,6 +88,24 @@ def normalize_group_message(payload: Any) -> PlatformEvent:
         raise ValueError("OneBot 群消息缺少会话或用户标识")
     sender = _value(payload, "sender", {}) or {}
     role = str(_value(sender, "role") or "") or None
+    bot_id = str(_value(payload, "_bot_id") or _value(payload, "self_id") or "")
+    mentioned = False
+    message = _value(payload, "message")
+    if isinstance(message, list):
+        mentioned = any(
+            isinstance(segment, dict)
+            and segment.get("type") == "at"
+            and bool(bot_id)
+            and str((segment.get("data") or {}).get("qq") or "") == bot_id
+            for segment in message
+        )
+    elif bot_id:
+        raw_message = str(message)
+        # OneBot 字符串格式通常使用 CQ 码，部分网关也会转成 <@QQ>。
+        mentioned = bool(
+            re.search(rf"\[CQ:at\s*,\s*qq\s*=\s*{re.escape(bot_id)}\s*\]", raw_message)
+            or re.search(rf"<@!?{re.escape(bot_id)}>", raw_message)
+        )
     message_id = _value(payload, "message_id")
     return PlatformEvent(
         event_id=_event_id(payload),
@@ -100,6 +118,7 @@ def normalize_group_message(payload: Any) -> PlatformEvent:
         raw=payload,
         is_bot=False,
         group_role=role,
+        is_bot_mentioned=mentioned,
     )
 
 

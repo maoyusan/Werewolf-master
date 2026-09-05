@@ -283,6 +283,13 @@ class GameApplication:
     async def handle_event(self, event: PlatformEvent) -> list[OutboundMessage]:
         if event.is_bot:
             return []
+        # 群里只有斜杠指令或明确 @Bot 才进入解析；普通聊天完全忽略。
+        if (
+            event.session.session_type == SessionType.GROUP
+            and not (event.text or "").lstrip().startswith("/")
+            and not event.is_bot_mentioned
+        ):
+            return []
         self._record_message(event)
         claimed, cached = await self.store.begin_event(event.event_id, event.session.key)
         if not claimed:
@@ -2532,6 +2539,7 @@ class GameApplication:
         # 同一会话内的批内序号：让「同一条消息回复多条」时每条 delivery_id 不同。
         counters: dict[str, int] = {}
         for domain_event in events:
+            text = domain_event.text
             # QQ 版投票确认按当前玩法在群里播报；领域事件仍保留官方的私聊目标，便于其他平台复用。
             broadcast_vote = domain_event.kind == "vote_accepted" and room.phase == GamePhase.VOTE
             if domain_event.public or broadcast_vote:
@@ -2556,12 +2564,28 @@ class GameApplication:
                 target = private.session
                 reply_to = private.reply_to
                 event_id = private.event_id
+                text = domain_event.text
+                # 所有对局私聊统一带座位上下文，避免玩家在私聊里看不到自己的号码，
+                # 也避免把队友/目标昵称和座位对应错。
+                if room.phase not in {GamePhase.LOBBY, GamePhase.CANCELLED}:
+                    current = next((p for p in room.players if p.user_id == domain_event.target_user_id), None)
+                    roster = "、".join(
+                        f"{p.seat}号({p.nickname if p.display_name.strip() and not is_opaque_display_name(p.display_name) else '-'})"
+                        for p in sorted(room.players, key=lambda item: item.seat)
+                    )
+                    if current is not None:
+                        current_name = (
+                            current.nickname
+                            if current.display_name.strip() and not is_opaque_display_name(current.display_name)
+                            else "-"
+                        )
+                        text = f"当前座位：{current.seat}号({current_name})\n玩家：{roster}\n{text}"
             index = counters.get(target.key, 0)
             counters[target.key] = index + 1
             messages.append(
                 OutboundMessage(
                     target=target,
-                    text=domain_event.text,
+                    text=text,
                     room_id=room.session_id,
                     reply_to=reply_to,
                     source_event_id=source.event_id,

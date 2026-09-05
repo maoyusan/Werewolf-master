@@ -252,6 +252,9 @@ class NapCatAdapter:
     async def dispatch_raw_message(self, normalizer: Any, payload: Any, *, source: str) -> None:
         """归一化 OneBot 事件并交给应用层，任何异常都不能拖垮读循环。"""
         try:
+            if isinstance(payload, dict) and source == "group":
+                payload = dict(payload)
+                payload["_bot_id"] = self.self_id
             event = normalizer(payload)
         except ValueError as exc:
             log.warning(
