@@ -734,6 +734,8 @@ class GameApplication:
         QQ 侧经常直接拦截，用户只看到第一条。现在保留锚点，靠 deliveries.msg_seq
         递增来满足官方「同一 msg_id 回复多条必须换 msg_seq」的要求。
         """
+        if room_id is None and session.session_type in {SessionType.C2C, SessionType.DIRECT}:
+            room_id = self._source_group_id(event)
         return OutboundMessage(
             target=session,
             text=text,
@@ -2417,6 +2419,9 @@ class GameApplication:
         return OutboundMessage(
             target=target.session,
             text=text,
+            # 群内触发的私聊保留来源群号，NapCat 可据此发群临时会话，
+            # 即使玩家尚未添加机器人好友也能收到消息。
+            room_id=self._source_group_id(source),
             reply_to=target.reply_to,
             source_event_id=source.event_id,
             event_id=target.event_id,
@@ -2432,9 +2437,9 @@ class GameApplication:
     async def _private_target(self, user_id: str, source: PlatformEvent) -> _PrivateTarget:
         """算出私聊目标会话。
 
-        NapCat 下这件事已经没有难度可言：user_id 就是玩家的真实 QQ 号，群聊里
-        看到的那一份和私聊窗口里的那一份完全相同，直接 send_private_msg 即可，
-        不需要绑定、不需要映射表，也不存在「无好友关系」那种作用域错配。
+        NapCat 下 user_id 就是玩家的真实 QQ 号，群聊和私聊使用同一标识；群内触发
+        的消息还会由 _private_message 保留来源群号，交给适配器发送临时会话。
+        不需要绑定或额外映射表。
 
         唯一还值得区分的情况是：这条消息本来就是该玩家私聊发来的，
         那就顺手带上 msg_id 走引用回复，观感更好。
@@ -2603,6 +2608,8 @@ class GameApplication:
 
     @staticmethod
     def _reply(event: PlatformEvent, text: str, *, room_id: str | None = None) -> OutboundMessage:
+        if room_id is None and event.session.session_type in {SessionType.C2C, SessionType.DIRECT}:
+            room_id = GameApplication._source_group_id(event)
         return OutboundMessage(
             target=event.session,
             text=text,
@@ -2611,6 +2618,16 @@ class GameApplication:
             source_event_id=event.event_id,
             event_id=event.event_id,
         )
+
+    @staticmethod
+    def _source_group_id(event: PlatformEvent) -> str | None:
+        """提取群消息或群临时私聊的来源群号。"""
+        if event.session.session_type == SessionType.GROUP:
+            return event.session.session_id
+        raw = event.raw
+        if isinstance(raw, dict) and raw.get("group_id") not in (None, ""):
+            return str(raw["group_id"])
+        return None
 
     def _split_messages(self, messages: Iterable[OutboundMessage]) -> list[OutboundMessage]:
         """按长度切片，并给同一会话的每条消息编批内序号。

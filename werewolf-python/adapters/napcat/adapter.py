@@ -334,7 +334,25 @@ class NapCatAdapter:
                 if record.target_type == SessionType.GROUP:
                     await self.call("send_group_msg", group_id=numeric, message=record.text)
                 elif record.target_type in (SessionType.C2C, SessionType.DIRECT):
-                    await self.call("send_private_msg", user_id=numeric, message=record.text)
+                    # OneBot 11 的 send_msg 支持携带 group_id 的群临时会话。
+                    # 群内触发的私聊记录会把来源群号放在 room_id；没有群上下文
+                    # 的真正 C2C 消息仍使用标准 send_private_msg。
+                    if record.room_id:
+                        try:
+                            source_group = int(str(record.room_id).strip())
+                        except (TypeError, ValueError) as exc:
+                            raise PermanentSendError(
+                                f"临时私聊来源群号不是 QQ 号：{record.room_id}"
+                            ) from exc
+                        await self.call(
+                            "send_msg",
+                            message_type="private",
+                            user_id=numeric,
+                            group_id=source_group,
+                            message=record.text,
+                        )
+                    else:
+                        await self.call("send_private_msg", user_id=numeric, message=record.text)
                 else:
                     raise PermanentSendError(f"NapCat 不支持的消息目标类型：{record.target_type}")
             except (TransientSendError, PermanentSendError):

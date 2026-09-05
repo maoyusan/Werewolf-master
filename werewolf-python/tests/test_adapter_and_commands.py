@@ -474,7 +474,7 @@ def test_group_delivery_calls_send_group_msg() -> None:
     assert calls == [("send_group_msg", {"group_id": 20001, "message": "天黑请闭眼。"})]
 
 
-def test_private_delivery_calls_send_private_msg() -> None:
+def test_group_context_private_delivery_uses_temporary_session() -> None:
     adapter, calls = _napcat_adapter()
     record = _record(
         delivery_id="delivery-2",
@@ -483,7 +483,30 @@ def test_private_delivery_calls_send_private_msg() -> None:
         text="你的身份：预言家",
     )
     asyncio.run(adapter.send_delivery(record))
-    assert calls == [("send_private_msg", {"user_id": 10001, "message": "你的身份：预言家"})]
+    assert calls == [
+        (
+            "send_msg",
+            {
+                "message_type": "private",
+                "user_id": 10001,
+                "group_id": 20001,
+                "message": "你的身份：预言家",
+            },
+        )
+    ]
+
+
+def test_private_delivery_without_group_context_calls_send_private_msg() -> None:
+    adapter, calls = _napcat_adapter()
+    record = _record(
+        delivery_id="delivery-2b",
+        target_type=SessionType.C2C,
+        target_id="10001",
+        room_id=None,
+        text="直接私聊",
+    )
+    asyncio.run(adapter.send_delivery(record))
+    assert calls == [("send_private_msg", {"user_id": 10001, "message": "直接私聊"})]
 
 
 def test_delivery_to_non_numeric_target_is_permanently_dead() -> None:
@@ -544,6 +567,22 @@ def test_private_message_targets_the_players_qq_number() -> None:
     assert message.event_id is None
 
 
+def test_private_message_from_group_keeps_group_context_for_temporary_session() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    source = normalize_group_message(
+        {
+            "message_type": "group",
+            "group_id": 20001,
+            "user_id": 10001,
+            "message": "/身份",
+            "message_id": 88,
+        }
+    )
+    message = asyncio.run(app._private_message("10002", "你的身份：预言家", source))
+    assert message.target == PlatformSession(SessionType.C2C, "10002")
+    assert message.room_id == "20001"
+
+
 def test_private_message_quotes_the_players_own_private_message() -> None:
     app = GameApplication(InMemoryRoomStore([]))
     source = normalize_private_message({
@@ -555,6 +594,23 @@ def test_private_message_quotes_the_players_own_private_message() -> None:
     message = asyncio.run(app._private_message("10002", "查验结果：好人", source))
     assert message.target.session_id == "10002"
     assert message.reply_to == "2002"
+    assert message.room_id is None
+
+
+def test_private_message_from_group_temporary_session_keeps_group_context() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    source = normalize_private_message(
+        {
+            "message_id": 2003,
+            "user_id": 10002,
+            "group_id": 20001,
+            "sub_type": "group",
+            "raw_message": "/身份",
+            "sender": {"user_id": 10002, "nickname": "乙"},
+        }
+    )
+    message = asyncio.run(app._private_message("10002", "身份：预言家", source))
+    assert message.room_id == "20001"
 
 
 def test_identity_delivery_needs_no_binding_hint() -> None:
