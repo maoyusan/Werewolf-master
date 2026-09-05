@@ -11,7 +11,7 @@ import asyncpg
 from domain.models import GamePhase, GameRoom, KillMethod
 
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 
 
 class ConcurrentStateError(RuntimeError):
@@ -46,22 +46,6 @@ def _iso(value: Any) -> str | None:
     """把数据库时间字段转成 ISO 字符串，供观测页 JSON 序列化。"""
     parsed = _parse_time(value) if value is not None else None
     return parsed.isoformat() if parsed else None
-
-
-def _delivery_anchor(reply_to: str | None, event_id: str | None) -> str | None:
-    """算出一条出站消息可用的「被动回复锚点」。
-
-    QQ 官方接口只放行被动回复：要么带用户消息的 ``msg_id``（reply_to），要么带
-    平台事件的 ``event_id``。定时器自造的 ``timer:`` 前缀不是平台事件号，带上去
-    照样是主动推送，因此必须排除。返回 None 表示这条消息现在发不出去。
-    """
-    anchor = (reply_to or "").strip()
-    if anchor:
-        return anchor
-    candidate = (event_id or "").strip()
-    if not candidate or candidate.startswith("timer:"):
-        return None
-    return candidate
 
 
 def _delivery_view(row: Any) -> dict[str, Any]:
@@ -239,7 +223,9 @@ class PostgreSQLStore:
         return [
             room
             for room in rooms
-            if any(player.user_id == user_id and player.alive for player in room.players)
+            # 出局玩家仍属于当前对局：私聊命令需要先定位到房间，
+            # 再由应用层返回“出局玩家不能行动”，同时阻止其趁本局未结束加入别群。
+            if any(player.user_id == user_id for player in room.players)
         ]
 
     async def find_rooms_for_user(self, user_id: str) -> list[GameRoom]:
@@ -359,29 +345,14 @@ class PostgreSQLStore:
                         now,
                     )
                 for message in message_list:
-                        # QQ 官方只允许「被动回复」：消息必须挂在一个 msg_id（reply_to）
-                        # 或 event_id 锚点上，否则接口直接回「主动消息失败, 无权限」
-                        # 或单聊「无好友关系」。
-                        # 群聊没有锚点时先挂 waiting，等同会话下一条真实消息来借锚点。
-                        # 单聊没有锚点时通常仍先 pending 试一次：真有单聊会话就能发出去；
-                        # 被拒后再由投递循环挂成 waiting，等用户私聊一条消息来救。
-                        # 唯一的例外是 requires_anchor：应用层已经确认这个 openid 是群
-                        # 作用域的、压根不能用于单聊接口，那就别浪费一次注定失败的调用，
-                        # 直接挂 waiting 等 /link 关联成功后改写目标。
-                        anchor = _delivery_anchor(message.reply_to, message.event_id)
-                        is_private = message.target.session_type.value in {"c2c", "direct"}
-                        sendable = is_private and not getattr(message, "requires_anchor", False)
-                        status = "pending" if (anchor or sendable) else "waiting"
-                        # msg_seq 必须按锚点递增：同一条锚点回复多条时，
-                        # 官方接口会把重复的 msg_seq 判为重复请求丢弃，导致用户完全收不到。
+                        # NapCat（OneBot 11）没有「被动回复」限制：不需要锚点、不需要
+                        # 递增 msg_seq，任何时候都能主动发群消息和私聊消息。所以这里
+                        # 一律直接落成 pending，交给投递循环发出去。
+                        # reply_to 仍然保留，但它只是「引用回复哪条消息」的可选装饰。
                         await connection.execute(
                             "INSERT INTO deliveries(delivery_id, target_type, target_id, text, room_id, reply_to, "
                             "source_event_id, event_id, state_version, msg_seq, status, attempts, next_attempt_at, created_at, updated_at) "
-                            "SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, "
-                            "CASE WHEN $11::text IS NULL THEN 1 ELSE "
-                            "COALESCE((SELECT MAX(d.msg_seq) FROM deliveries d "
-                            " WHERE COALESCE(NULLIF(d.reply_to, ''), NULLIF(d.event_id, '')) = $11::text), 0) + 1 END, "
-                            "$12, 0, $10, $10, $10 "
+                            "VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, 'pending', 0, $10, $10, $10) "
                             "ON CONFLICT(delivery_id) DO NOTHING",
                             message.delivery_id,
                             message.target.session_type.value,
@@ -393,8 +364,6 @@ class PostgreSQLStore:
                             message.event_id,
                             room.state_version if room else None,
                             now,
-                            anchor,
-                            status,
                         )
                         if room is not None:
                             await connection.execute(
@@ -445,66 +414,6 @@ class PostgreSQLStore:
                     limit,
                 )
                 return [self._delivery_from_row(row) for row in rows]
-
-    async def bind_waiting_deliveries(
-        self,
-        target_type: str,
-        target_id: str,
-        *,
-        reply_to: str | None,
-        event_id: str | None,
-        limit: int = 4,
-    ) -> int:
-        """把某个会话里挂起的消息绑到刚收到的新锚点上，转成可投递状态。
-
-        这是「主动消息失败, 无权限」的正解：机器人不能主动推送，但只要该会话里
-        有人再说一句话，就又有了一条可以被动回复的 msg_id。上限默认 4 条，
-        因为官方对同一锚点的回复条数有约 5 条的限制，留一条余量给本次事件自己。
-        """
-        anchor = _delivery_anchor(reply_to, event_id)
-        if not anchor:
-            return 0
-        now = datetime.now(timezone.utc)
-        async with self.pool.acquire() as connection:
-            async with connection.transaction():
-                rows = await connection.fetch(
-                    "WITH picked AS ("
-                    "  SELECT delivery_id, row_number() OVER (ORDER BY created_at, delivery_id) AS rn"
-                    "    FROM deliveries"
-                    "   WHERE status='waiting' AND target_type=$1 AND target_id=$2"
-                    "   ORDER BY created_at, delivery_id LIMIT $3"
-                    "), base AS ("
-                    "  SELECT COALESCE(MAX(msg_seq), 0) AS seq FROM deliveries"
-                    "   WHERE COALESCE(NULLIF(reply_to, ''), NULLIF(event_id, '')) = $4::text"
-                    ") "
-                    "UPDATE deliveries d SET status='pending', reply_to=$5, event_id=$6, "
-                    "msg_seq=(SELECT seq FROM base) + p.rn, next_attempt_at=$7, updated_at=$7 "
-                    "FROM picked p WHERE d.delivery_id = p.delivery_id "
-                    "RETURNING d.delivery_id",
-                    str(target_type),
-                    str(target_id),
-                    int(max(1, limit)),
-                    anchor,
-                    reply_to,
-                    event_id,
-                    now,
-                )
-        return len(rows)
-
-    async def expire_waiting_deliveries(self, max_age_seconds: int = 900) -> int:
-        """挂太久还没等到锚点的消息直接判死，不再占着队列也不再报警。"""
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(seconds=max(60, int(max_age_seconds)))
-        async with self.pool.acquire() as connection:
-            rows = await connection.fetch(
-                "UPDATE deliveries SET status='dead', next_attempt_at=NULL, updated_at=$1, "
-                "last_error=COALESCE(NULLIF(last_error, ''), "
-                "'等待被动回复锚点超时：该会话长时间没有新消息，QQ 不允许主动推送') "
-                "WHERE status='waiting' AND created_at < $2 RETURNING delivery_id",
-                now,
-                cutoff,
-            )
-        return len(rows)
 
     async def purge_finished_deliveries(self, max_age_seconds: int = 86400) -> int:
         """清掉早就没有价值的 sent/dead 记录，别让 deliveries 无限膨胀。"""
@@ -564,254 +473,6 @@ class PostgreSQLStore:
             "last_sequence": row["last_sequence"],
             "updated_at": row["updated_at"],
         }
-
-    async def save_direct_session(self, user_id: str, guild_id: str) -> None:
-        """记住用户已经打开的 QQ 私信会话。"""
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "INSERT INTO direct_sessions(user_id, guild_id, updated_at) "
-                "VALUES($1, $2, now()) "
-                "ON CONFLICT(user_id) DO UPDATE SET guild_id=EXCLUDED.guild_id, "
-                "updated_at=EXCLUDED.updated_at",
-                str(user_id),
-                str(guild_id),
-            )
-
-    async def get_direct_session(self, user_id: str) -> str | None:
-        async with self.pool.acquire() as connection:
-            return await connection.fetchval(
-                "SELECT guild_id FROM direct_sessions WHERE user_id=$1", str(user_id)
-            )
-
-    async def save_user_reply_anchor(
-        self,
-        user_id: str,
-        session_type: str,
-        session_id: str,
-        msg_id: str,
-        event_id: str | None,
-    ) -> None:
-        """记住用户最近一条私聊的 msg_id，供之后的身份/夜间提示做被动回复。"""
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "INSERT INTO user_reply_anchors("
-                "user_id, session_type, session_id, msg_id, event_id, uses, updated_at) "
-                "VALUES($1, $2, $3, $4, $5, 0, now()) "
-                "ON CONFLICT(user_id) DO UPDATE SET "
-                "session_type=EXCLUDED.session_type, session_id=EXCLUDED.session_id, "
-                "msg_id=EXCLUDED.msg_id, event_id=EXCLUDED.event_id, uses=0, "
-                "updated_at=EXCLUDED.updated_at",
-                str(user_id),
-                str(session_type),
-                str(session_id),
-                str(msg_id),
-                str(event_id) if event_id else None,
-            )
-
-    async def get_user_reply_anchor(self, user_id: str) -> dict[str, Any] | None:
-        async with self.pool.acquire() as connection:
-            row = await connection.fetchrow(
-                "SELECT session_type, session_id, msg_id, event_id, uses, updated_at "
-                "FROM user_reply_anchors WHERE user_id=$1",
-                str(user_id),
-            )
-        if row is None:
-            return None
-        return {
-            "session_type": row["session_type"],
-            "session_id": row["session_id"],
-            "msg_id": row["msg_id"],
-            "event_id": row["event_id"],
-            "uses": int(row["uses"] or 0),
-            "updated_at": row["updated_at"],
-        }
-
-    async def note_user_reply_anchor_use(self, user_id: str) -> None:
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "UPDATE user_reply_anchors SET uses=uses+1 WHERE user_id=$1",
-                str(user_id),
-            )
-
-    # ------------------------------------------------------------------
-    # QQ 两套 openid 的映射（migrations/013_openid_links.sql）
-    # ------------------------------------------------------------------
-
-    async def link_openid(
-        self,
-        member_openid: str,
-        c2c_openid: str,
-        *,
-        source: str = "code",
-        union_openid: str | None = None,
-    ) -> int:
-        """关联「群作用域 openid」与「单聊作用域 openid」，并改写待发消息的目标。
-
-        改写这一步是整个修复的落点：关联建立之前入队的私聊消息，target_id 存的
-        还是群作用域 openid，那个地址在单聊接口下根本不存在，重试多少次都只会
-        拿到「无好友关系」。关联成功的瞬间把它们指到正确的单聊 openid 上并重新
-        入队，玩家立刻能收到之前卡住的身份牌和夜间提示。
-        返回被改写的出站消息条数。
-        """
-        member = str(member_openid).strip()
-        c2c = str(c2c_openid).strip()
-        if not member or not c2c:
-            return 0
-        now = datetime.now(timezone.utc)
-        async with self.pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "INSERT INTO openid_links(member_openid, c2c_openid, union_openid, source) "
-                    "VALUES($1, $2, $3, $4) ON CONFLICT(member_openid) DO UPDATE SET "
-                    "c2c_openid=EXCLUDED.c2c_openid, "
-                    "union_openid=COALESCE(EXCLUDED.union_openid, openid_links.union_openid), "
-                    "source=EXCLUDED.source, updated_at=now()",
-                    member,
-                    c2c,
-                    (union_openid or None),
-                    str(source),
-                )
-                await connection.execute(
-                    "DELETE FROM openid_link_codes WHERE member_openid=$1", member
-                )
-                if member == c2c:
-                    return 0
-                # 只捞发不出去的三种状态：pending/sending 可能正被投递循环持有，
-                # 中途改地址会和它打架。
-                rows = await connection.fetch(
-                    "UPDATE deliveries SET target_id=$1, status='pending', attempts=0, "
-                    "last_error=NULL, reply_to=NULL, event_id=NULL, next_attempt_at=$2, updated_at=$2 "
-                    "WHERE target_type='c2c' AND target_id=$3 "
-                    "AND status IN ('waiting', 'failed', 'retry') RETURNING delivery_id",
-                    c2c,
-                    now,
-                    member,
-                )
-        return len(rows)
-
-    async def get_c2c_openid(self, member_openid: str) -> str | None:
-        """查群作用域 openid 对应的单聊 openid；没关联过就返回 None。"""
-        async with self.pool.acquire() as connection:
-            value = await connection.fetchval(
-                "SELECT c2c_openid FROM openid_links WHERE member_openid=$1",
-                str(member_openid),
-            )
-        return str(value) if value else None
-
-    async def is_known_c2c_openid(self, openid: str) -> bool:
-        """这个 openid 本身是否已经被确认是单聊作用域的。
-
-        玩家直接在私聊里 /join 时，房间里存的就是单聊 openid，不需要再做映射。
-        """
-        async with self.pool.acquire() as connection:
-            value = await connection.fetchval(
-                "SELECT 1 FROM openid_links WHERE c2c_openid=$1 LIMIT 1", str(openid)
-            )
-            if value:
-                return True
-            scope = await connection.fetchval(
-                "SELECT openid_scope FROM players WHERE user_id=$1", str(openid)
-            )
-        return str(scope or "") == "c2c"
-
-    async def note_union_openid(self, user_id: str, union_openid: str, scope: str) -> str | None:
-        """记下平台下发的 union_openid，并在两侧都出现过时自动完成关联。
-
-        union_openid 是唯一能让玩家完全无感完成关联的路径。当前 qq-botpy 的
-        消息对象没有暴露它，所以这条路平时不会命中；一旦官方或适配层把该字段
-        透出来，这里就自动生效，不需要玩家再走 /link。返回配对成功的对端 openid。
-        """
-        union = str(union_openid or "").strip()
-        user = str(user_id).strip()
-        if not union or not user or scope not in {"member", "c2c"}:
-            return None
-        column = "member_openid" if scope == "member" else "c2c_openid"
-        other = "c2c_openid" if scope == "member" else "member_openid"
-        async with self.pool.acquire() as connection:
-            if scope == "member":
-                await connection.execute(
-                    "INSERT INTO openid_links(member_openid, union_openid, source) "
-                    "VALUES($1, $2, 'union') ON CONFLICT(member_openid) DO UPDATE SET "
-                    "union_openid=EXCLUDED.union_openid, updated_at=now()",
-                    user,
-                    union,
-                )
-            peer = await connection.fetchval(
-                f"SELECT {other} FROM openid_links WHERE union_openid=$1 AND {other} IS NOT NULL "
-                f"AND {column} IS DISTINCT FROM $2 LIMIT 1",
-                union,
-                user,
-            )
-            if peer is None and scope == "c2c":
-                peer = await connection.fetchval(
-                    "SELECT member_openid FROM openid_links WHERE union_openid=$1 "
-                    "AND (c2c_openid IS NULL OR c2c_openid <> $2) LIMIT 1",
-                    union,
-                    user,
-                )
-        return str(peer) if peer else None
-
-    async def find_qq_number_peer(
-        self, user_id: str, qq_number: str, wanted_scope: str
-    ) -> str | None:
-        """按「同一个真实 QQ 号」找出另一侧作用域的 openid。
-
-        玩家在群里和私聊里各 /bindqq 一次同样的号码，就等于自己完成了实名对齐，
-        不必再记一次性关联码。
-        """
-        number = str(qq_number or "").strip()
-        if not number:
-            return None
-        async with self.pool.acquire() as connection:
-            value = await connection.fetchval(
-                "SELECT user_id FROM players WHERE qq_number=$1 AND user_id<>$2 "
-                "AND openid_scope=$3 ORDER BY updated_at DESC LIMIT 1",
-                number,
-                str(user_id),
-                str(wanted_scope),
-            )
-        return str(value) if value else None
-
-    async def create_link_code(self, member_openid: str, code: str) -> None:
-        """给这个群作用域 openid 记一枚一次性关联码，重复申请会覆盖旧码。"""
-        async with self.pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "DELETE FROM openid_link_codes WHERE member_openid=$1 OR code=$2",
-                    str(member_openid),
-                    str(code),
-                )
-                await connection.execute(
-                    "INSERT INTO openid_link_codes(code, member_openid) VALUES($1, $2)",
-                    str(code),
-                    str(member_openid),
-                )
-
-    async def consume_link_code(self, code: str, max_age_seconds: int = 1800) -> str | None:
-        """核销一次性关联码，返回对应的群作用域 openid；过期或不存在返回 None。"""
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(60, int(max_age_seconds)))
-        async with self.pool.acquire() as connection:
-            value = await connection.fetchval(
-                "DELETE FROM openid_link_codes WHERE code=$1 AND created_at >= $2 "
-                "RETURNING member_openid",
-                str(code).strip(),
-                cutoff,
-            )
-        return str(value) if value else None
-
-    async def park_delivery_waiting(self, delivery_id: str, error: str) -> None:
-        """主动推送被拒后挂起，等该会话下一条真实用户消息来借 msg_id。"""
-        now = datetime.now(timezone.utc)
-        safe_error = " ".join(str(error).split())[:500]
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "UPDATE deliveries SET status='waiting', reply_to=NULL, event_id=NULL, "
-                "last_error=$1, next_attempt_at=NULL, updated_at=$2 "
-                "WHERE delivery_id=$3 AND status IN ('sending','pending','retry')",
-                safe_error,
-                now,
-                delivery_id,
-            )
 
     async def get_group_rule_config(self, group_id: str) -> dict[str, Any]:
         async with self.pool.acquire() as connection:
@@ -1225,6 +886,21 @@ class PostgreSQLStore:
             views.append(view)
         return views
 
+    async def clear_failed_deliveries(self) -> int:
+        """把失败/重试中的出站消息一次判死。
+
+        观测页「清除」用这个：停止继续重试，同时让它们从异常投递列表消失。
+        不直接 DELETE，房间「最近消息」里还能看到已判死记录和原来的错误原因。
+        """
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                "UPDATE deliveries SET status='dead', next_attempt_at=NULL, updated_at=$1 "
+                "WHERE status IN ('failed', 'retry') RETURNING delivery_id",
+                now,
+            )
+        return len(rows)
+
     async def delivery_summary(self) -> dict[str, int]:
         """出站队列各状态的条数，用来判断「机器人是不是卡在发送环节」。"""
         async with self.pool.acquire() as connection:
@@ -1253,61 +929,26 @@ class PostgreSQLStore:
                 cleaned,
             )
 
-    async def note_openid_scope(self, user_id: str, scope: str) -> None:
-        """记住这个 openid 是在群里还是在单聊里见到的。
-
-        QQ 对同一个人在群和单聊下发两个不同的 openid，光看字符串分不出来。
-        只有把作用域记下来，才能靠「同一个真实 QQ 号」把两侧配成一对。
-        """
-        value = (scope or "").strip() or None
-        if value is None:
-            return
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "INSERT INTO players(user_id, openid_scope) VALUES($1, $2) "
-                "ON CONFLICT(user_id) DO UPDATE SET openid_scope=EXCLUDED.openid_scope, "
-                "updated_at=now()",
-                str(user_id),
-                value,
-            )
-
-    async def set_player_qq_number(self, user_id: str, qq_number: str | None) -> None:
-        """记录玩家自助绑定的真实 QQ 号；传 None 表示解绑。
-
-        QQ 开放平台对第三方机器人只下发 openid，真号拿不到，只能靠 /bindqq。
-        """
-        value = (qq_number or "").strip() or None
-        async with self.pool.acquire() as connection:
-            await connection.execute(
-                "INSERT INTO players(user_id, qq_number) VALUES($1, $2) "
-                "ON CONFLICT(user_id) DO UPDATE SET qq_number=EXCLUDED.qq_number, updated_at=now()",
-                str(user_id),
-                value,
-            )
-
     async def get_player_profiles(self, user_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
-        """批量取「昵称 + QQ 号」，供玩家名单一次性补全展示信息。"""
+        """批量取玩家昵称，供玩家名单一次性补全展示信息。
+
+        NapCat 下 user_id 本身就是真实 QQ 号，不再需要额外的 qq_number 列。
+        """
         ids = [str(item) for item in user_ids if item]
         if not ids:
             return {}
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(
-                "SELECT user_id, name, qq_number FROM players WHERE user_id = ANY($1::text[])",
+                "SELECT user_id, name FROM players WHERE user_id = ANY($1::text[])",
                 ids,
             )
-        return {
-            str(row["user_id"]): {
-                "name": row["name"],
-                "qq_number": row["qq_number"],
-            }
-            for row in rows
-        }
+        return {str(row["user_id"]): {"name": row["name"]} for row in rows}
 
     async def get_player(self, user_id: str) -> dict[str, Any] | None:
         """DevCommands.cs:730-740 /whois、1568-1610 /user 读取的玩家档案。"""
         async with self.pool.acquire() as connection:
             row = await connection.fetchrow(
-                "SELECT p.user_id, p.name, p.qq_number, p.temp_ban_count, p.first_seen, "
+                "SELECT p.user_id, p.name, p.temp_ban_count, p.first_seen, "
                 "(SELECT count(*) FROM game_players gp WHERE gp.user_id = p.user_id) AS games, "
                 "(SELECT min(g.time_started) FROM game_players gp JOIN games g "
                 " ON g.game_id = gp.game_id WHERE gp.user_id = p.user_id) AS first_game "
@@ -1319,7 +960,6 @@ class PostgreSQLStore:
         return {
             "user_id": row["user_id"],
             "name": row["name"],
-            "qq_number": row["qq_number"],
             "temp_ban_count": int(row["temp_ban_count"] or 0),
             "first_seen": row["first_seen"],
             "games": int(row["games"] or 0),

@@ -22,9 +22,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      napcat:
+        condition: service_started
     environment:
-      APP_ID: ${APP_ID:?请在 .env 中填写 APP_ID}
-      APP_SECRET: ${APP_SECRET:?请在 .env 中填写 APP_SECRET}
+      NAPCAT_WS_URL: ${NAPCAT_WS_URL:?请在 .env 中填写 NAPCAT_WS_URL}
+      NAPCAT_ACCESS_TOKEN: ${NAPCAT_ACCESS_TOKEN:-}
       DATABASE_URL: postgresql://werewolf:${POSTGRES_PASSWORD:-werewolf-local}@db:5432/werewolf
       HOST: 0.0.0.0
       PORT: 18100
@@ -57,6 +59,8 @@ services:
       ALLOW_NSFW: ${ALLOW_NSFW:-false}
       DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-5}
       DELIVERY_POLL_SECONDS: ${DELIVERY_POLL_SECONDS:-2}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:18100:18100"
     command: ["/bin/sh", "-c", "python -m main migrate && exec python -m main run"]
@@ -65,6 +69,21 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    mac_address: "02:42:ac:11:00:02"
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3001:3001"
+      # 6099 落在 Windows Hyper-V 排除端口段 6086-6185，改映射到 18099
+      - "127.0.0.1:18099:6099"
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/ntqq:/app/.config/QQ
 
 volumes:
   werewolf-postgres:

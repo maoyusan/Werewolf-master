@@ -7,6 +7,12 @@ from typing import Iterable
 from .models import ALL_ROLES, ROLE_METADATA, WOLF_ROLES, GameMode, GameRules, RandomSource, Role
 
 
+class GameRuleError(ValueError):
+    """游戏规则拒绝异常，保留在 rules 模块供旧调用方兼容导入。"""
+
+    pass
+
+
 OFFICIAL_COMMIT = "ca547ccb0ed01e6f282f9e8e71f7a24d547b24d7"
 OFFICIAL_ROLE_SOURCE = "Shared/Roles.cs"
 OFFICIAL_BALANCE_SOURCE = "Shared/GameBalancing.cs"

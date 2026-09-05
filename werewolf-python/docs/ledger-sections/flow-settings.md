@@ -1,10 +1,12 @@
 # 分片：阶段总流程 / 轮次与倒计时 / 指令状态矩阵 / 设置与恢复（任务 3.2-3.5、7.1-7.5）
 
+> 复查说明（2026-09-05）：本文下方部分差异表保留了历史审计记录，`xfail` 及旧的测试数量不代表当前代码状态。当前工作区已移除这些 `xfail` 标记；请以 `python -m pytest -q` 的实时结果和 `docs/official-parity-checklist.md` 为准。
+
 - 官方基线：`work/upstream-official`，提交 `ca547ccb0ed01e6f282f9e8e71f7a24d547b24d7`
 - 检查日期：2026-09-01
-- 新增测试文件：`tests/test_audit_flow_settings.py`（17 passed, 9 xfailed）
+- 新增测试文件：`tests/test_audit_flow_settings.py`（当前收集 26 项，均通过）
 - 引用的既有测试：`tests/test_official_parity.py`、`tests/test_parity.py`、`tests/test_adapter_and_commands.py`（引用行均以 `-k` 组合重跑确认 `64 passed`）
-- 复跑命令：`python -m pytest tests/test_audit_flow_settings.py`（`17 passed, 9 xfailed`）；全量 `python -m pytest`（`312 passed, 29 xfailed`）
+- 复跑命令：`python -m pytest tests/test_audit_flow_settings.py -q`（当前 `26 passed`）。
 
 | 编号 | 官方文件:行号 | 调用来源 | 条件 | 官方结果 | Python 位置 | 测试 | 固定输入 | 实测结果 | 状态 | 差异编号 | 复查日期 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

@@ -1,6 +1,6 @@
 # Linux 运行、备份与回滚
 
-官方 Python 服务只使用 PostgreSQL 和 QQ 官方 Gateway WebSocket。凭据必须通过环境变量或受限 `EnvironmentFile` 注入，不得写入镜像或仓库。
+官方 Python 服务只使用 PostgreSQL 和 NapCat（OneBot 11）正向 WebSocket。凭据必须通过环境变量或受限 `EnvironmentFile` 注入，不得写入镜像或仓库。
 
 ## 最小命令
 
@@ -36,7 +36,7 @@ python -m pytest tests/test_parity.py
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 APP_ID、APP_SECRET 和可选的 ADMIN_USER_IDS
+# 编辑 .env，填入 NAPCAT_WS_URL、可选的 NAPCAT_ACCESS_TOKEN 和 ADMIN_USER_IDS
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
@@ -45,10 +45,10 @@ docker compose -f deploy/docker-compose.yml up -d --build
 ## 发布
 
 1. `pg_dump "$DATABASE_URL" -Fc -f /var/backups/werewolf/pre-release.dump`
-2. 校验 `DATABASE_URL`、`APP_ID`、`APP_SECRET` 存在且不是仓库中的历史值。
+2. 校验 `DATABASE_URL`、`NAPCAT_WS_URL` 存在且不是仓库中的历史值，并确认 NapCat 已登录机器人 QQ、正向 WebSocket 可连通。
 3. 安装新版本代码，执行 `python -m main migrate`。
 4. 启动服务并等待 `/readyz` 成功。
-5. 用测试群跑一局：建局、私聊行动、投票、Gateway 断线恢复。
+5. 用测试群跑一局：建局、私聊行动、投票、NapCat 断线恢复。
 
 ## 回滚
 
@@ -60,4 +60,6 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 ## 密钥
 
-历史上在聊天中出现过的 AppSecret 必须在正式接入前轮换。新密钥只通过环境注入，不写入 git、镜像层或普通日志。
+NapCat 侧唯一的凭据是正向 WebSocket 的 `NAPCAT_ACCESS_TOKEN`。它只通过环境注入，不写入 git、镜像层或普通日志；泄露后在 NapCat 配置里改掉并同步 `werewolf.env` 即可。
+
+机器人 QQ 账号本身的登录态由 NapCat 持有，本服务不接触密码或登录凭证。历史上官方开放平台时代的 AppID/AppSecret 已随迁移全部废弃，如仍在平台侧存在请直接删除该应用凭据。

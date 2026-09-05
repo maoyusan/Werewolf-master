@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import secrets
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -22,9 +21,6 @@ from domain.models import (
     Role,
     Team,
     is_opaque_display_name,
-    is_real_qq_number,
-    qq_label,
-    qq_short_id,
 )
 from domain.locale import (
     CATALOG,
@@ -41,7 +37,6 @@ from infrastructure.observability import TRACE
 
 from .commands import Command, parse_command
 from .contracts import (
-    NeedsAnchorSendError,
     OutboundMessage,
     PermanentSendError,
     PlatformEvent,
@@ -55,19 +50,18 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _PrivateTarget:
-    """一条私聊消息该发到哪、能不能现在就发。
+    """一条私聊消息该发到哪。
 
-    `origin` 记录这个标识是怎么来的（当前会话／映射表／回复锚点／频道私信），
-    只进日志，方便下次一眼看出「无好友关系」到底是标识拿错还是真的没会话。
-    `requires_anchor=True` 表示手上只有群作用域 openid，调单聊接口必然失败，
-    应当挂 waiting 等 /link 关联后由 link_openid 改写目标，而不是白发一次。
+    NapCat 下私聊标识就是玩家的 QQ 号，跟群里那一份完全一致，
+    不存在官方开放平台那种「群作用域 openid 发不了单聊」的问题，
+    所以这里既不需要锚点，也不需要 waiting 状态。
+    `origin` 只进日志，方便排查目标是怎么定下来的。
     """
 
     session: PlatformSession
     reply_to: str | None
     event_id: str | None
     origin: str
-    requires_anchor: bool = False
 
 
 HELP_TEXT = (
@@ -88,11 +82,6 @@ HELP_TEXT = (
     "用「确认」「重选」「取消」回应即可。\n"
     "/身份 查看自己的身份，/统计 /结算 查看数据与结果。\n"
     "— 其它 —\n"
-    "/link：开通私聊通道（群里发 /link 领关联码，私聊发「/link 关联码」）\n"
-    "（QQ 给同一个人在群里和私聊里发的是两个不同标识，不关联就收不到身份牌，"
-    "会提示「无好友关系」；只加机器人好友没有用，一定要做一次 /link）\n"
-    "/bindqq 你的QQ号：登记真实 QQ 号，之后玩家名单会显示「座位号+QQ号+昵称」\n"
-    "（QQ 官方不向机器人下发真实号码，只能本人登记一次；/unbindqq 解绑，/whoami 查看）\n"
     "/rolelist 身份列表　/grouplist 群列表　/nextgame 预约下一局　/config 查看本群规则\n"
     "/ping /version /changelog /help"
 )
@@ -132,6 +121,13 @@ _TARGETED_NIGHT_COMMANDS = frozenset({
 })
 _TARGETED_DAY_COMMANDS = frozenset({"detect", "shoot"})
 _CONFIRM_ONLY_DAY_COMMANDS = frozenset({"silver", "sandman", "mayor", "pacifist", "trouble"})
+
+# 用户需求第四条：出局玩家本局内不再参与游戏。
+# 这几条是纯查询/说明，死人照样能用；其余一律拦掉。
+_DEAD_ALLOWED_COMMANDS = frozenset({
+    "help", "status", "identity", "result", "stats", "ping", "config", "about",
+    "rolelist", "version", "changelog", "achv", "myidles",
+})
 
 # Attributes/CommandAttribute.cs —— 官方权限分档。
 # GroupAdminOnly：Commands/AdminCommands.cs 里带 `GroupAdminOnly = true` 的命令。
@@ -202,6 +198,83 @@ class GameApplication:
         self._tx_window: list[datetime] = []
         # UpdateHandler.UserMessages（Handlers/UpdateHandler.cs:28）。
         self._user_messages: dict[str, list[tuple[datetime, str]]] = {}
+        # NapCat 适配器，由 main.py 通过 bind_platform 注入。
+        # 只用来做「读群成员昵称 / 改群名片 / 探测机器人是不是群管」这类平台能力，
+        # 拿不到（单测、离线跑）时全部静默降级，不影响任何游戏流程。
+        self.platform = None
+        # 群号 → 本局是否允许改名片。开局时探测一次，避免每次改名都问一遍。
+        self._card_permission: dict[str, bool] = {}
+        # 群号 → {玩家: 上次写进去的群名片}，只对有变化的人发请求。
+        self._card_state: dict[str, dict[str, str]] = {}
+
+    def bind_platform(self, platform) -> None:
+        """注入平台适配器（NapCat）。"""
+        self.platform = platform
+
+    # ---------------- 平台能力：群名片与昵称 ----------------
+
+    async def _can_manage_cards(self, group_id: str) -> bool:
+        """机器人在该群是不是群主/管理员——不是就完全不碰群名片。"""
+        platform = self.platform
+        if platform is None or not hasattr(platform, "is_group_admin"):
+            return False
+        key = str(group_id)
+        cached = self._card_permission.get(key)
+        if cached is not None:
+            return cached
+        try:
+            allowed = bool(await platform.is_group_admin(key))
+        except Exception:
+            log.exception("探测机器人群权限失败", extra={"room_id": key})
+            allowed = False
+        self._card_permission[key] = allowed
+        return allowed
+
+    async def _set_card(self, group_id: str, user_id: str, card: str) -> None:
+        platform = self.platform
+        if platform is None or not hasattr(platform, "set_group_card"):
+            return
+        try:
+            await platform.set_group_card(str(group_id), str(user_id), card)
+        except Exception:
+            log.exception(
+                "修改群名片失败", extra={"room_id": str(group_id), "user_id": str(user_id)}
+            )
+
+    async def _sync_cards(self, room: GameRoom) -> None:
+        """把群名片同步成当前局内状态。
+
+        用户需求第三、四条：机器人是群主/管理员时，群内身份直接以号码为准，
+        出局的人名片改成「N号（已出局）」，一眼就能看出谁还在局内。
+        对局结束后清空名片，把展示权还给玩家自己。
+
+        只对「和上次不一样」的人发请求，所以每批事件都可以无脑调用一次；
+        改名片纯属锦上添花，任何一步失败都只记日志，绝不打断游戏流程。
+        """
+        group_id = str(room.session_id)
+        # 大厅阶段还没分配座位，不碰任何人的名片。
+        if room.phase is GamePhase.LOBBY:
+            return
+        if not await self._can_manage_cards(group_id):
+            return
+
+        finished = room.phase in {GamePhase.FINISHED, GamePhase.CANCELLED}
+        applied = self._card_state.setdefault(group_id, {})
+        for player in room.players:
+            if finished:
+                card = ""
+            elif player.alive:
+                card = f"{player.seat}号"
+            else:
+                card = f"{player.seat}号（已出局）"
+            if applied.get(player.user_id) == card:
+                continue
+            await self._set_card(group_id, player.user_id, card)
+            applied[player.user_id] = card
+        if finished:
+            # 本局记录清掉，下一局重新按新座位号铺一遍。
+            self._card_state.pop(group_id, None)
+            self._card_permission.pop(group_id, None)
 
     async def _lock_for(self, key: str) -> asyncio.Lock:
         async with self._locks_guard:
@@ -234,8 +307,6 @@ class GameApplication:
                     action_key=event.event_id,
                     action_data={"name": action_name, "user_id": event.user_id},
                 )
-                # 本次消息已经占好 msg_seq，剩下的余量拿来救之前发不出去的挂起消息。
-                await self._bind_waiting_anchor(event)
                 TRACE.record(
                     self._room_id(event),
                     "指令分发",
@@ -289,15 +360,13 @@ class GameApplication:
                 return messages
 
     async def _remember_user(self, event: PlatformEvent) -> None:
-        """每条消息都把「openid → QQ 昵称」归档进 players 表。
+        """每条消息都把「QQ 号 → 昵称」归档进 players 表。
 
-        对应官方 Helpers.cs:60-78 的 UpdatePlayerName。这一步是整条身份链路的
-        源头：QQ 群消息大多不下发昵称，但私聊、频道会带，只要玩家在任意一个
-        场景露过名字，之后所有名单、私聊提示和后台都能显示昵称而不是座位号。
+        对应官方 Helpers.cs:60-78 的 UpdatePlayerName。NapCat 下每条群消息都带
+        sender.nickname，所以这一步基本每次都能拿到真名；名单、私聊提示和后台
+        因此都能显示「1号 沉潜」而不是光秃秃的座位号。
         归档失败只记日志，绝不能因此挡住玩家的正常指令。
         """
-        await self._remember_private_anchor(event)
-        await self._remember_openid_scope(event)
         setter = getattr(self.store, "touch_player", None)
         if setter is None:
             return
@@ -308,52 +377,6 @@ class GameApplication:
             await setter(event.user_id, name or None)
         except Exception:
             log.exception("归档玩家昵称失败", extra={"user_id": event.user_id})
-
-    async def _remember_openid_scope(self, event: PlatformEvent) -> None:
-        """记录这个 openid 属于哪个作用域，并在拿得到 union_openid 时自动关联。
-
-        作用域必须落库：光看字符串分不出 member_openid 和 user_openid，
-        而「按同一个 QQ 号配对两侧」只有知道作用域才做得成。
-        union_openid 是官方唯一能让玩家零操作完成关联的字段——目前 qq-botpy
-        的消息对象没有暴露它，所以这条分支平时不会命中；一旦上游透出来，
-        这里立刻生效，玩家不必再走 /link。
-        """
-        if event.user_id == "system":
-            return
-        scope = self._openid_scope(event)
-        if scope is None:
-            return
-        noter = getattr(self.store, "note_openid_scope", None)
-        if noter is not None:
-            try:
-                await noter(event.user_id, scope)
-            except Exception:
-                log.exception("归档 openid 作用域失败", extra={"user_id": qq_short_id(event.user_id)})
-        union_id = (event.union_id or "").strip()
-        if not union_id:
-            return
-        union_noter = getattr(self.store, "note_union_openid", None)
-        linker = getattr(self.store, "link_openid", None)
-        if union_noter is None or linker is None:
-            return
-        try:
-            peer = await union_noter(event.user_id, union_id, scope)
-            if not peer:
-                return
-            member = event.user_id if scope == "member" else str(peer)
-            c2c = str(peer) if scope == "member" else event.user_id
-            requeued = await linker(member, c2c, source="union", union_openid=union_id)
-        except Exception:
-            log.exception("按 union_openid 关联标识失败", extra={"user_id": qq_short_id(event.user_id)})
-            return
-        log.info(
-            "已按 union_openid 自动完成群/单聊标识关联",
-            extra={
-                "member_openid": qq_short_id(member),
-                "c2c_openid": qq_short_id(c2c),
-                "requeued": requeued,
-            },
-        )
 
     async def _dispatch(self, event: PlatformEvent) -> tuple[GameRoom | None, list[OutboundMessage], str]:
         command = parse_command(event.text)
@@ -438,8 +461,8 @@ class GameApplication:
             events = [
                 DomainEvent(
                     "room_created",
-                    # 群消息经常拿不到昵称，此时绝不能把 openid 打进正文；
-                    # 建房回复本身就是被动回复（已 @ 发起人），退化成「你」即可。
+                    # NapCat 下 sender.nickname 基本都有；极少数拿不到时
+                    # 退化成「你」，绝不把任何内部标识打进正文。
                     f"房间已创建，发起人是{self._event_public_name(event)}，正在等待玩家加入。",
                 )
             ]
@@ -457,12 +480,6 @@ class GameApplication:
 
         if command.name == "stop_waiting":
             return await self._stop_waiting(event, command.argument)
-
-        if command.name in {"bind_qq", "unbind_qq", "whoami"}:
-            return await self._identity_command(event, command)
-
-        if command.name == "link":
-            return await self._link_command(event, command)
 
         if command.name in {"ping", "chatid", "changelog", "runinfo", "rolelist", "grouplist", "version", "setlang", "getlang", "myidles", "achv"}:
             return await self._official_info(event, command.name, command.argument)
@@ -505,17 +522,17 @@ class GameApplication:
         if room is None:
             raise GameRuleError("当前会话没有活动房间，请先发送 /startgame")
 
+        # 用户需求第四条：出局玩家本局内不再参与游戏，
+        # 所有游戏操作类指令一律拦下，只保留查询类（前面已经返回过了）。
+        # /flee 与 /vote 需要进入领域层，分别返回官方 DeadFlee/不能投票 文案；
+        # 其它游戏操作仍由统一闸门拦截，避免遗漏存活校验。
+        if command.name not in {"flee", "vote", "abstain"}:
+            self._reject_if_dead(room, event, command)
+
         if command.name == "join":
             self._require_group(event)
             await self._ensure_user_can_join_active_room(event.user_id, room.session_id)
-            # 入场时把玩家自助绑定过的 QQ 号一并带进 Player，
-            # 之后所有名单/私聊文案都能直接给出「座位号 + QQ 号 + 昵称」。
-            events = self.engine.join(
-                room,
-                event.user_id,
-                event.display_name,
-                await self._bound_qq_number(event.user_id),
-            )
+            events = self.engine.join(room, event.user_id, event.display_name)
         elif command.name == "leave":
             self._require_group(event)
             events = self.engine.leave(room, event.user_id)
@@ -755,7 +772,7 @@ class GameApplication:
                         if value == item.user_id
                         or value.casefold() == item.display_name.casefold()
                         or value.casefold() == item.public_name.casefold()
-                        or value.casefold() == item.list_label.casefold()
+                        or value.casefold() == item.short_label.casefold()
                     ),
                     None,
                 )
@@ -825,13 +842,13 @@ class GameApplication:
         language = await self._user_language(event.user_id)
         lines: list[str] = []
         for user_id in targets:
-            # 名单里给「座位号 + QQ号 + 昵称」；不在本局的人退化成短内部号，
-            # 不把 32 位 openid 原样打到群里。
-            label = f"内部号{qq_short_id(user_id)}"
+            # 名单里统一给「座位号 + QQ 昵称」；不在本局的人只给一个中性占位，
+            # 绝不把 QQ 号或任何内部标识打到群里。
+            label = "（不在本局）"
             if room is not None:
                 player = next((item for item in room.players if item.user_id == user_id), None)
                 if player is not None:
-                    label = player.list_label
+                    label = player.short_label
             idles = await counter(user_id) if counter is not None else 0
             group_idles = (
                 await counter(user_id, event.session.session_id) if counter is not None else 0
@@ -927,7 +944,7 @@ class GameApplication:
         if room is None:
             raise GameRuleError("找不到该群的对局。")
         lines = [
-            f"{player.list_label}: {role_display_name(player.role) if player.role else '未分配'}"
+            f"{player.short_label}: {role_display_name(player.role) if player.role else '未分配'}"
             for player in room.players
         ]
         text = "\n".join(lines) if lines else "该对局没有玩家。"
@@ -976,7 +993,7 @@ class GameApplication:
         language = await self._user_language(user_id)
         lines = [
             self._admin_target_label(user_id, player),
-            f"内部号：{qq_short_id(user_id)}",
+            f"QQ 号：{user_id}",
             "------------------",
             f"参与对局：{player['games']} 局",
             f"语言：{language}",
@@ -1075,7 +1092,7 @@ class GameApplication:
             banned_by=(
                 event.display_name.strip()
                 if not is_opaque_display_name(event.display_name)
-                else f"内部号{qq_short_id(event.user_id)}"
+                else event.user_id
             ),
             expires=_PERMANENT_BAN_EXPIRES,
         )
@@ -1451,7 +1468,7 @@ class GameApplication:
 
         官方 `UserMessages[target]` 取不到键会抛 KeyNotFoundException，
         由 UpdateHandler 统一回执错误；端口改成一条明确的拒绝信息。
-        官方还会 `long.Parse` 用户 ID，QQ 的 openid 是字符串，无需转换。
+        官方还会 `long.Parse` 用户 ID，这里统一按字符串处理，不做转换。
         """
         target = argument.split()[0].lstrip("@") if argument else ""
         entries = self._user_messages.get(target)
@@ -1481,7 +1498,7 @@ class GameApplication:
             )
         player = await self.store.get_player(user_id)
         if player is None:
-            text = f"数据库里找不到玩家 内部号{qq_short_id(user_id)}。"
+            text = f"数据库里找不到 QQ 号 {user_id} 对应的玩家。"
         else:
             text = f"玩家 {self._admin_target_label(user_id, player)} 没有可迁移的旧成就记录。"
         return None, [self._reply(event, text, room_id=self._room_id(event))], "moveachv"
@@ -1688,7 +1705,7 @@ class GameApplication:
             random.shuffle(choices)
         return (
             f"请选择第 {current}/{total} 个目标：\n"
-            + "\n".join(player.list_label for player in choices)
+            + "\n".join(player.short_label for player in choices)
             + "\n直接回复座位号；可发送“取消”结束本次选择。"
         )
 
@@ -1885,10 +1902,10 @@ class GameApplication:
         if not groups:
             text = "最近 21 天内还没有活跃的狼人杀群。"
         else:
-            # 群名拿不到时用短群号兜底：group_id 也是 32 位 openid，
-            # 直接摊在私聊里既难读又是内部标识外泄。
+            # 群名拿不到时用群号兜底。NapCat 下 group_id 就是真实群号，
+            # 群号本身是公开信息，可以直接展示。
             body = "\n\n".join(
-                f"{item.get('name') or ('群' + qq_short_id(str(item['group_id'])))}"
+                f"{item.get('name') or ('群' + str(item['group_id']))}"
                 f"（近 21 天 {item.get('games', 0)} 局）"
                 for item in groups
             )
@@ -1989,85 +2006,22 @@ class GameApplication:
     # 定时推进（Program.cs 的 GameTimer 循环）
     # ------------------------------------------------------------------
 
-    # QQ 官方被动回复的 msg_id 有时效，超过大约 5 分钟就只能走主动推送。
-    _TIMER_ANCHOR_WINDOW = timedelta(minutes=5)
-    # 官方允许同一条 msg_id 回复约 5 条，定时器最多借 4 次，留一条余量。
-    _TIMER_ANCHOR_MAX_USES = 4
-    # 一条锚点最多借给 4 条挂起消息：官方对同一锚点的回复条数上限约 5 条，
-    # 留一条给本次事件自己的回复，超出的等下一条群消息再补。
-    _WAITING_BIND_LIMIT = 4
-    # 挂起超过这个时长就别等了：会话已经冷掉，内容也早过时。
-    _WAITING_ANCHOR_SECONDS = 900
     # 已完结（sent/dead）的投递记录保留一天，够排查也不会撑爆表。
     _DELIVERY_RETENTION_SECONDS = 86400
 
-    def _remember_group_anchor(self, room: GameRoom, source: PlatformEvent) -> None:
-        """记住本群最近一条真实群消息的回复锚点，留给定时器播报复用。
+    def _timer_event(self, room: GameRoom, event_id: str) -> PlatformEvent:
+        """定时器推进用的合成事件。
 
-        定时器自己产生的事件没有 QQ 原始消息号，只能主动推送，而主动推送极易被
-        平台拦截 —— 这正是「后台已经进入夜晚、群里却一片安静」的成因。
+        NapCat 可以主动发消息，超时播报直接发群里就行，
+        不再需要官方开放平台那套「借一条群消息当回复锚点」的把戏。
         """
 
-        if source.user_id == "system":
-            return
-        if source.session.session_type != SessionType.GROUP:
-            return
-        if source.session.session_id != room.session_id:
-            return
-        room.statistics["last_group_msg_id"] = source.reply_message_id or ""
-        room.statistics["last_group_event_id"] = source.event_id or ""
-        room.statistics["last_group_msg_at"] = datetime.now(timezone.utc).isoformat()
-        # 换了新锚点就重新计次：这条 msg_id 还没被定时器借用过。
-        room.statistics["last_group_msg_uses"] = 0
-
-    def _timer_event(self, room: GameRoom, event_id: str) -> PlatformEvent:
-        """给定时器事件套上可用的群消息锚点，让超时播报也能走被动回复。"""
-
-        anchor_id = str(room.statistics.get("last_group_msg_id") or "")
-        anchor_at = room.statistics.get("last_group_msg_at")
-        try:
-            used = int(room.statistics.get("last_group_msg_uses") or 0)
-        except (TypeError, ValueError):
-            used = 0
-        usable = False
-        if anchor_id and anchor_at and used < self._TIMER_ANCHOR_MAX_USES:
-            try:
-                stamp = datetime.fromisoformat(str(anchor_at))
-            except ValueError:
-                stamp = None
-            if stamp is not None:
-                if stamp.tzinfo is None:
-                    stamp = stamp.replace(tzinfo=timezone.utc)
-                usable = datetime.now(timezone.utc) - stamp <= self._TIMER_ANCHOR_WINDOW
-        if usable:
-            # 官方允许同一条 msg_id 回复约 5 条（靠递增 msg_seq 区分），所以锚点
-            # 不必「用完即作废」——旧实现一局只能借一次，之后的夜晚/白天播报全部
-            # 退化成主动推送，被平台直接拒绝，这正是 failed 堆积的主因之一。
-            room.statistics["last_group_msg_uses"] = used + 1
-            TRACE.record(
-                room.session_id,
-                "定时器",
-                f"复用最近一条群消息作为回复锚点（第 {used + 1} 次），超时播报走被动回复",
-            )
-        else:
-            room.statistics["last_group_msg_id"] = ""
-            room.statistics["last_group_event_id"] = ""
-            TRACE.record(
-                room.session_id,
-                "定时器",
-                "没有可用的群消息锚点，超时播报将挂起等待下一条群消息",
-            )
-            log.info(
-                "定时器播报缺少群消息锚点，出站消息将挂起等待锚点",
-                extra={"room_id": room.session_id, "phase": room.phase.value},
-            )
         return PlatformEvent(
             event_id=event_id,
             session=PlatformSession(SessionType.GROUP, room.session_id),
             user_id="system",
             display_name="system",
             text="",
-            reply_message_id=anchor_id if usable else None,
         )
 
     async def process_due_rooms(self) -> int:
@@ -2101,6 +2055,7 @@ class GameApplication:
                     f"阶段「{self._phase_text(before_phase)}」已到期，开始推进",
                     状态版本=room.state_version,
                 )
+                before_snapshot = room.snapshot()
                 try:
                     if room.phase == GamePhase.LOBBY:
                         await self._prepare_achievement_state(room)
@@ -2131,6 +2086,10 @@ class GameApplication:
                         "定时器",
                         f"推进失败：{type(exc).__name__}: {exc}",
                     )
+                    # 引擎或消息转换可能已部分修改房间。恢复推进前快照后明确解散，
+                    # 避免该 timer event 被幂等标记为 done 却永远停在过期阶段。
+                    room = GameRoom.from_snapshot(before_snapshot)
+                    room_events = self.engine.abandon_overdue(room)
                     error = [
                         OutboundMessage(
                             target=PlatformSession(SessionType.GROUP, room.session_id),
@@ -2138,6 +2097,11 @@ class GameApplication:
                             room_id=room.session_id,
                         )
                     ]
+                    error.extend(
+                        await self._events_to_messages(
+                            room_events, room, self._timer_event(room, event_id)
+                        )
+                    )
                     await self.store.commit_result(
                         room=room,
                         event_id=event_id,
@@ -2173,16 +2137,14 @@ class GameApplication:
     async def process_deliveries(self, sender, max_attempts: int) -> int:
         """认领一批待投递消息并发送；单个目标失败不影响整批。
 
-        失败分三类，处理方式完全不同：
-        - 缺锚点（`NeedsAnchorSendError`，典型是单聊「无好友关系」）：
-          挂起 waiting，等该用户再发一条私聊/群消息后补 msg_id。
-        - 永久失败（`PermanentSendError`，参数非法、被限制）：
+        NapCat 可以主动发消息，不存在官方开放平台那种「缺回复锚点」的挂起态，
+        所以失败只分两类：
+        - 永久失败（`PermanentSendError`，参数非法、目标不是 QQ 号、被限制）：
           直接判死，不再占用队列也不再计入告警。
         - 其余失败：按指数退避重试，用满次数才落 failed。
         """
         processed = 0
-        # 顺手做两件清理，成本很低但能防止队列无限膨胀：
-        # 等不到回复锚点的挂起消息判死，早就完结的记录定期删掉。
+        # 顺手清理早就完结的记录，成本很低但能防止队列无限膨胀。
         await self._sweep_deliveries()
         for pending in await self.store.pending_deliveries():
             record = await self.store.claim_delivery(pending.delivery_id)
@@ -2190,22 +2152,6 @@ class GameApplication:
                 continue
             try:
                 await sender.send_delivery(record)
-            except NeedsAnchorSendError as exc:
-                parker = getattr(self.store, "park_delivery_waiting", None)
-                if parker is not None:
-                    await parker(record.delivery_id, str(exc))
-                else:
-                    await self.store.mark_delivery_dead(record.delivery_id, str(exc))
-                log.warning(
-                    "消息缺少可推送会话，已挂起等待用户再发一条消息",
-                    extra={"delivery_id": record.delivery_id, "reason": str(exc)[:120]},
-                )
-                TRACE.record(
-                    record.room_id,
-                    "投递",
-                    f"官方拒绝主动推送，已挂起等待同会话下一条消息：{str(exc)[:120]}",
-                    投递号=record.delivery_id[:12],
-                )
             except PermanentSendError as exc:
                 await self.store.mark_delivery_dead(record.delivery_id, str(exc))
                 log.warning(
@@ -2238,49 +2184,13 @@ class GameApplication:
         return processed
 
     async def _sweep_deliveries(self) -> None:
-        """清理挂起过久和早已完结的投递记录；出错只记日志，不影响正常发送。"""
-        expire = getattr(self.store, "expire_waiting_deliveries", None)
-        if expire is not None:
-            try:
-                expired = await expire(self._WAITING_ANCHOR_SECONDS)
-            except Exception:
-                log.exception("清理挂起投递失败")
-            else:
-                if expired:
-                    log.info("挂起投递等不到回复锚点，已判死", extra={"count": expired})
+        """清理早已完结的投递记录；出错只记日志，不影响正常发送。"""
         purge = getattr(self.store, "purge_finished_deliveries", None)
         if purge is not None:
             try:
                 await purge(self._DELIVERY_RETENTION_SECONDS)
             except Exception:
                 log.exception("清理历史投递失败")
-
-    async def _bind_waiting_anchor(self, event: PlatformEvent) -> None:
-        """用刚收到的这条真实消息，把该会话里挂起的出站消息救回来。
-
-        机器人不能主动推送，但只要会话里有人再说一句话，就又有了一条可以被动
-        回复的 msg_id。必须在本次事件自己的消息入库之后调用，否则 msg_seq 会撞车。
-        """
-        binder = getattr(self.store, "bind_waiting_deliveries", None)
-        if binder is None or event.user_id == "system":
-            return
-        try:
-            bound = await binder(
-                event.session.session_type.value,
-                event.session.session_id,
-                reply_to=event.reply_message_id,
-                event_id=event.event_id,
-                limit=self._WAITING_BIND_LIMIT,
-            )
-        except Exception:
-            log.exception("挂起投递补锚点失败", extra={"session": event.session.key})
-            return
-        if bound:
-            TRACE.record(
-                self._room_id(event),
-                "投递",
-                f"用本条消息为 {bound} 条挂起消息补上回复锚点，重新入队",
-            )
 
     async def _room_for_event(self, event: PlatformEvent) -> GameRoom | None:
         if event.session.session_type == SessionType.GROUP:
@@ -2299,8 +2209,15 @@ class GameApplication:
         if event.session.session_type == SessionType.GROUP:
             room = await self.store.get_room(event.session.session_id)
         else:
-            rooms = await self.store.find_rooms_for_user(event.user_id)
-            room = rooms[0] if len(rooms) == 1 else None
+            # 私聊查询优先当前活动房间；历史对局不应阻塞正在进行的身份查询。
+            active_rooms = await self.store.find_active_rooms_for_user(event.user_id)
+            if len(active_rooms) == 1:
+                room = active_rooms[0]
+            elif active_rooms:
+                room = None
+            else:
+                rooms = await self.store.find_rooms_for_user(event.user_id)
+                room = rooms[0] if len(rooms) == 1 else None
         await self._refresh_player_identities(room)
         return room
 
@@ -2405,239 +2322,25 @@ class GameApplication:
         text += "\n发送 /stopwaiting 可以取消排队。"
         return None, [await self._private_message(event.user_id, text, event)], "nextgame"
 
-    async def _bound_qq_number(self, user_id: str) -> str | None:
-        """读取玩家自助绑定的真实 QQ 号；没绑定或存储层不支持时返回 None。
-
-        QQ 开放平台不给第三方机器人下发真实 QQ 号，只有 openid，所以名单里的
-        「qq号：xxx」只可能来自玩家本人 /bindqq 的登记。
-        """
-        getter = getattr(self.store, "get_player", None)
-        if getter is None:
-            return None
-        try:
-            record = await getter(user_id)
-        except Exception:
-            log.exception("读取玩家绑定 QQ 号失败", extra={"user_id": user_id})
-            return None
-        if not record:
-            return None
-        value = str(record.get("qq_number") or "").strip()
-        return value or None
-
-    async def _identity_command(
-        self, event: PlatformEvent, command: Command
-    ) -> tuple[GameRoom | None, list[OutboundMessage], str]:
-        """/bindqq、/unbindqq、/whoami —— 玩家自助维护「QQ 号 ↔ 昵称」映射。
-
-        绑定是自助的而不是系统自动获取的：官方开放平台只下发 openid，
-        机器人拿不到真实 QQ 号，因此只能由本人登记一次，之后所有名单、
-        私聊提示和后台展示都能拼出「1号 qq号：xxx｜昵称：yyy」。
-        """
-        room = await self._room_for_event(event)
-        room_id = self._room_id(event)
-        nickname = (
-            event.display_name.strip()
-            if not is_opaque_display_name(event.display_name)
-            else ""
-        )
-        setter = getattr(self.store, "set_player_qq_number", None)
-
-        if command.name == "whoami":
-            bound = await self._bound_qq_number(event.user_id)
-            lines = [
-                "你的身份信息：",
-                f"qq号：{qq_label(event.user_id, bound)}",
-                f"昵称：{nickname or '（QQ 未下发昵称）'}",
-                f"内部号：{qq_short_id(event.user_id)}",
-            ]
-            if not bound:
-                lines.append("发送 /bindqq 你的QQ号 可以把真实 QQ 号显示在玩家名单里。")
-            return room, [self._reply(event, "\n".join(lines), room_id=room_id)], "whoami"
-
-        if setter is None:
-            raise GameRuleError("当前存储不支持 QQ 号绑定")
-
-        if command.name == "unbind_qq":
-            await setter(event.user_id, None)
-            self._apply_qq_number_to_rooms(room, event.user_id, None)
-            return (
-                room,
-                [self._reply(event, "已解除 QQ 号绑定，之后名单里只显示昵称。", room_id=room_id)],
-                "unbind_qq",
-            )
-
-        value = (command.argument or "").strip()
-        if not value:
-            raise GameRuleError("用法：/bindqq 你的QQ号，例如 /bindqq 3183848638")
-        if not is_real_qq_number(value):
-            raise GameRuleError("QQ 号格式不对：应为 5~15 位、不以 0 开头的纯数字")
-        await setter(event.user_id, value)
-        self._apply_qq_number_to_rooms(room, event.user_id, value)
-        text = f"已绑定 QQ 号 {value}｜昵称：{nickname or '（QQ 未下发昵称）'}"
-        # 同一个真实 QQ 号在群侧和私聊侧各绑一次，就等于本人确认了「这两个 openid
-        # 是同一个人」，可以直接完成关联，省掉 /link 那一次性码。
-        bridged = await self._bridge_by_qq_number(event, value)
-        if bridged:
-            text += "\n" + bridged
-        return room, [self._reply(event, text, room_id=room_id)], "bind_qq"
-
-    @staticmethod
-    def _openid_scope(event: PlatformEvent) -> str | None:
-        """这条事件里的 user_id 属于哪个作用域。
-
-        QQ 群消息给的是 member_openid（只在该群有效），单聊给的是 user_openid
-        （只在单聊有效），字符串本身看不出区别，只能靠事件来源判定。
-        """
-        if event.session.session_type == SessionType.GROUP:
-            return "member"
-        if event.session.session_type in {SessionType.C2C, SessionType.DIRECT}:
-            return "c2c"
-        return None
-
-    async def _bridge_by_qq_number(self, event: PlatformEvent, qq_number: str) -> str | None:
-        """两侧都登记了同一个真实 QQ 号时，自动把两个 openid 关联起来。"""
-        scope = self._openid_scope(event)
-        if scope is None:
-            return None
-        finder = getattr(self.store, "find_qq_number_peer", None)
-        linker = getattr(self.store, "link_openid", None)
-        if finder is None or linker is None:
-            return None
-        wanted = "c2c" if scope == "member" else "member"
-        try:
-            peer = await finder(event.user_id, qq_number, wanted)
-            if not peer:
-                return None
-            member = event.user_id if scope == "member" else str(peer)
-            c2c = str(peer) if scope == "member" else event.user_id
-            requeued = await linker(member, c2c, source="qq")
-        except Exception:
-            log.exception("按 QQ 号关联单聊标识失败", extra={"user_id": qq_short_id(event.user_id)})
-            return None
-        log.info(
-            "已按 QQ 号完成群/单聊标识关联",
-            extra={
-                "member_openid": qq_short_id(member),
-                "c2c_openid": qq_short_id(c2c),
-                "requeued": requeued,
-            },
-        )
-        tail = f"，之前卡住的 {requeued} 条私聊消息已重新入队" if requeued else ""
-        return f"检测到你在群里和私聊里绑定的是同一个 QQ 号，私聊通道已自动开通{tail}。"
-
-    async def _link_command(
-        self, event: PlatformEvent, command: Command
-    ) -> tuple[GameRoom | None, list[OutboundMessage], str]:
-        """/link —— 把「群里的你」和「私聊里的你」关联成同一个人。
-
-        这是「明明加了机器人却提示无好友关系」的正解。QQ 对同一个人在群聊和
-        单聊下发两个互不相同、也无法互相换算的 openid；玩家在群里 /join 时，
-        系统只拿得到群作用域的那一个，用它去调单聊接口，QQ 侧根本查不到对应
-        会话，于是不管有没有加机器人都固定回「无好友关系」。
-
-        群里发 /link 领一枚一次性码，私聊回发「/link 码」，两个标识就对上了，
-        并且此前挂起的身份牌、夜间提示会被改写目标后自动补发。
-        """
-        room = await self._room_for_event(event)
-        room_id = self._room_id(event)
-        scope = self._openid_scope(event)
-        argument = (command.argument or "").strip()
-
-        if scope == "member":
-            if argument:
-                raise GameRuleError("关联码要私聊机器人发送，不要发在群里。")
-            creator = getattr(self.store, "create_link_code", None)
-            if creator is None:
-                raise GameRuleError("当前存储不支持私聊通道关联")
-            code = f"{secrets.randbelow(1000000):06d}"
-            await creator(event.user_id, code)
-            return (
-                room,
-                [
-                    self._reply(
-                        event,
-                        f"你的私聊关联码：{code}（30 分钟内有效）\n"
-                        "请私聊本机器人发送：/link " + code + "\n"
-                        "完成后即可正常收到身份牌和夜间行动提示。",
-                        room_id=room_id,
-                    )
-                ],
-                "link",
-            )
-
-        if scope != "c2c":
-            raise GameRuleError("请在群里或私聊里使用 /link。")
-
-        if not argument:
-            checker = getattr(self.store, "is_known_c2c_openid", None)
-            hint = (
-                "请先在群里发送 /link 领取 6 位关联码，再回到这里发送「/link 关联码」。\n"
-                "关联之后，群里开局分配的身份牌才能发到这个私聊窗口。"
-            )
-            if checker is not None and await checker(event.user_id):
-                hint = "这个私聊窗口已经可用。" + hint
-            return room, [self._reply(event, hint, room_id=room_id)], "link"
-
-        code = argument.split()[0].strip()
-        consumer = getattr(self.store, "consume_link_code", None)
-        linker = getattr(self.store, "link_openid", None)
-        if consumer is None or linker is None:
-            raise GameRuleError("当前存储不支持私聊通道关联")
-        member = await consumer(code)
-        if not member:
-            raise GameRuleError("关联码无效或已过期，请回到群里重新发送 /link 领取。")
-        requeued = await linker(member, event.user_id, source="code")
-        log.info(
-            "已通过一次性码完成群/单聊标识关联",
-            extra={
-                "member_openid": qq_short_id(str(member)),
-                "c2c_openid": qq_short_id(event.user_id),
-                "requeued": requeued,
-            },
-        )
-        tail = (
-            f"\n之前发不出去的 {requeued} 条私聊消息已重新入队，稍后会送达。"
-            if requeued
-            else ""
-        )
-        return (
-            room,
-            [self._reply(event, "私聊通道已开通。" + tail, room_id=room_id)],
-            "link",
-        )
-
-    @staticmethod
-    def _apply_qq_number_to_rooms(
-        room: GameRoom | None, user_id: str, qq_number: str | None
-    ) -> None:
-        """绑定/解绑立刻同步到当前房间快照，不用等下一局才生效。"""
-        if room is None:
-            return
-        for player in room.players:
-            if player.user_id == user_id:
-                player.qq_number = qq_number
-
     @staticmethod
     def _admin_target_label(user_id: str, player: dict | None = None) -> str:
-        """管理/后台指令里统一的可读身份：「qq号：xxx｜昵称：yyy」。
+        """管理/后台指令里统一的可读身份。
 
-        绝不把 32 位 openid 原样回显给人看：没绑定真号时退化成「内部号XXXXXXXX」，
-        既能人工比对，又不会把完整内部标识摊在群里。
+        管理命令是给管理员排查用的，可以带真实 QQ 号；
+        但绝不再出现「内部号」这类系统标识 —— NapCat 下压根没有那种东西。
         """
         record = player or {}
-        qq_number = str(record.get("qq_number") or "").strip() or None
         nickname = str(record.get("name") or "").strip()
         if is_opaque_display_name(nickname):
             nickname = ""
-        return f"qq号：{qq_label(user_id, qq_number)}｜昵称：{nickname or '（未知昵称）'}"
+        return f"QQ 号：{user_id}｜昵称：{nickname or '（未知昵称）'}"
 
     async def _refresh_player_identities(self, room: GameRoom | None) -> None:
-        """用 players 表里的最新「昵称 + QQ 号」回填房间快照。
+        """用 players 表里的最新昵称回填房间快照。
 
-        两个真实场景必须靠这一步兜住：
-        1. 入场时 QQ 没下发昵称（群消息常态），事后玩家在私聊里露过名字；
-        2. 玩家入场后才 /bindqq 绑定真号。
-        不回填的话，这两类玩家在名单里永远缺信息，只能显示座位号。
+        入场那一刻拿到的昵称可能是空的（极少数消息不带 sender.nickname），
+        事后玩家再发一条消息就会被 `_remember_user` 归档，这里补回来，
+        名单才能稳定显示「1号 沉潜」而不是光秃秃的座位号。
         """
         if room is None or not room.players:
             return
@@ -2653,9 +2356,6 @@ class GameApplication:
             profile = profiles.get(player.user_id)
             if not profile:
                 continue
-            qq_number = str(profile.get("qq_number") or "").strip() or None
-            if qq_number:
-                player.qq_number = qq_number
             name = str(profile.get("name") or "").strip()
             # 只在当前展示名不可用时才覆盖，避免把本局用的昵称改掉。
             if name and not is_opaque_display_name(name) and (
@@ -2713,7 +2413,6 @@ class GameApplication:
             reply_to=target.reply_to,
             source_event_id=source.event_id,
             event_id=target.event_id,
-            requires_anchor=target.requires_anchor,
         )
 
     async def _private_destination(
@@ -2723,46 +2422,15 @@ class GameApplication:
         target = await self._private_target(user_id, source)
         return target.session, target.reply_to, target.event_id
 
-    async def _c2c_openid(self, user_id: str) -> tuple[str | None, str]:
-        """把任意一个 openid 解析成「可以调单聊接口的 openid」。
-
-        这是「无好友关系」的根因所在。QQ v2 对同一个人下发两个不同的标识：
-        群消息给 member_openid、单聊给 user_openid，作用域互不相通，官方也没有
-        换算接口。玩家几乎都是在群里 /join 进来的，房间快照里存的就是群作用域
-        的那一个；过去直接拿它去调 POST /v2/users/{openid}/messages，QQ 侧查不到
-        这个单聊会话，于是无论玩家有没有添加机器人，都固定返回「无好友关系」。
-
-        返回 (可用于单聊的 openid 或 None, 来源说明)。
-        """
-        checker = getattr(self.store, "is_known_c2c_openid", None)
-        if checker is not None:
-            try:
-                if await checker(user_id):
-                    return user_id, "本身即单聊标识"
-            except Exception:
-                log.exception("判断单聊标识失败", extra={"user_id": qq_short_id(user_id)})
-        getter = getattr(self.store, "get_c2c_openid", None)
-        if getter is None:
-            # 存储层不支持映射（测试替身、旧部署）：保持既有行为，直接用原标识。
-            return user_id, "存储层无映射能力"
-        try:
-            linked = await getter(user_id)
-        except Exception:
-            log.exception("查询 openid 映射失败", extra={"user_id": qq_short_id(user_id)})
-            return None, "映射查询异常"
-        if linked:
-            return str(linked), "openid 映射表"
-        return None, "尚未关联单聊标识"
-
     async def _private_target(self, user_id: str, source: PlatformEvent) -> _PrivateTarget:
-        """算出私聊目标会话，以及现在还能用的被动回复锚点。
+        """算出私聊目标会话。
 
-        优先级从「最可靠」到「最不可靠」：
-        1. 就是当前这条私聊事件本人 —— 会话和 msg_id 都是现成的；
-        2. openid 映射表解析出的单聊标识（+ 该标识最近一条私聊锚点）；
-        3. 官方频道私信会话；
-        4. 都没有 —— 明确标成「未开通私聊通道」，让消息挂 waiting 而不是拿一个
-           群作用域 openid 去撞「无好友关系」，再由 /link 关联成功后改写目标。
+        NapCat 下这件事已经没有难度可言：user_id 就是玩家的真实 QQ 号，群聊里
+        看到的那一份和私聊窗口里的那一份完全相同，直接 send_private_msg 即可，
+        不需要绑定、不需要映射表，也不存在「无好友关系」那种作用域错配。
+
+        唯一还值得区分的情况是：这条消息本来就是该玩家私聊发来的，
+        那就顺手带上 msg_id 走引用回复，观感更好。
         """
         if (
             source.session.session_type in {SessionType.C2C, SessionType.DIRECT}
@@ -2771,131 +2439,9 @@ class GameApplication:
             return _PrivateTarget(
                 source.session, source.reply_message_id, source.event_id, "当前私聊会话"
             )
-
-        openid, origin = await self._c2c_openid(user_id)
-        if openid:
-            anchor = await self._usable_anchor(openid)
-            if anchor is not None:
-                self._log_private_target(user_id, openid, f"{origin}+回复锚点", True)
-                return anchor
-            self._log_private_target(user_id, openid, origin, True)
-            return _PrivateTarget(PlatformSession(SessionType.C2C, openid), None, None, origin)
-
-        # 没解析出单聊标识时，原标识本身也可能挂着一条可用锚点（历史数据、频道私信）。
-        anchor = await self._usable_anchor(user_id)
-        if anchor is not None:
-            self._log_private_target(user_id, user_id, "历史回复锚点", True)
-            return anchor
-
-        getter_direct = getattr(self.store, "get_direct_session", None)
-        direct_id = await getter_direct(user_id) if getter_direct is not None else None
-        if direct_id:
-            self._log_private_target(user_id, str(direct_id), "频道私信会话", True)
-            return _PrivateTarget(
-                PlatformSession(SessionType.DIRECT, str(direct_id)), None, None, "频道私信会话"
-            )
-
-        self._log_private_target(user_id, user_id, origin, False)
         return _PrivateTarget(
-            PlatformSession(SessionType.C2C, user_id),
-            None,
-            None,
-            origin,
-            requires_anchor=True,
+            PlatformSession(SessionType.C2C, str(user_id)), None, None, "napcat 私聊"
         )
-
-    @staticmethod
-    def _log_private_target(user_id: str, target_id: str, origin: str, resolved: bool) -> None:
-        """把「发给谁、用的哪个标识、标识从哪来」写进日志。
-
-        以前只在失败处打一句「无好友关系」，看不出发送目标其实是个群作用域
-        openid，排查时会一路怀疑到「玩家是不是没加机器人」。这里固定记录来源，
-        下次一眼就能分辨是「标识拿错」还是「真的没有单聊会话」。
-        """
-        payload = {
-            "user_id": qq_short_id(user_id),
-            "target_id": qq_short_id(target_id),
-            "identity_source": origin,
-            "resolved": resolved,
-        }
-        if resolved:
-            log.debug("私聊目标已解析", extra=payload)
-        else:
-            log.warning(
-                "玩家还没开通单聊通道，消息先挂起（群作用域 openid 不能用于单聊接口）",
-                extra=payload,
-            )
-
-    async def _usable_anchor(self, user_id: str) -> _PrivateTarget | None:
-        """取该标识最近一条仍可用的被动回复锚点，顺便累计使用次数。"""
-        getter = getattr(self.store, "get_user_reply_anchor", None)
-        if getter is None:
-            return None
-        try:
-            anchor = await getter(user_id)
-        except Exception:
-            log.exception("读取私聊回复锚点失败", extra={"user_id": qq_short_id(user_id)})
-            return None
-        if not self._user_anchor_usable(anchor):
-            return None
-        assert anchor is not None
-        noter = getattr(self.store, "note_user_reply_anchor_use", None)
-        if noter is not None:
-            try:
-                await noter(user_id)
-            except Exception:
-                log.exception("累计私聊锚点使用次数失败", extra={"user_id": qq_short_id(user_id)})
-        return _PrivateTarget(
-            PlatformSession(SessionType(str(anchor["session_type"])), str(anchor["session_id"])),
-            str(anchor.get("msg_id") or "") or None,
-            str(anchor.get("event_id") or "") or None,
-            "回复锚点",
-        )
-
-    async def _remember_private_anchor(self, event: PlatformEvent) -> None:
-        """用户主动私聊时记住 msg_id，之后的身份/夜间提示才能走被动回复。"""
-        if event.user_id == "system":
-            return
-        if event.session.session_type not in {SessionType.C2C, SessionType.DIRECT}:
-            return
-        if not event.reply_message_id:
-            return
-        saver = getattr(self.store, "save_user_reply_anchor", None)
-        if saver is None:
-            return
-        try:
-            await saver(
-                event.user_id,
-                event.session.session_type.value,
-                event.session.session_id,
-                event.reply_message_id,
-                event.event_id,
-            )
-        except Exception:
-            log.exception("记录私聊回复锚点失败", extra={"user_id": event.user_id})
-
-    def _user_anchor_usable(self, anchor: dict | None) -> bool:
-        if not anchor:
-            return False
-        if not str(anchor.get("msg_id") or "").strip():
-            return False
-        try:
-            uses = int(anchor.get("uses") or 0)
-        except (TypeError, ValueError):
-            uses = 0
-        if uses >= self._TIMER_ANCHOR_MAX_USES:
-            return False
-        stamp = anchor.get("updated_at")
-        if stamp is None:
-            return False
-        if isinstance(stamp, str):
-            try:
-                stamp = datetime.fromisoformat(stamp)
-            except ValueError:
-                return False
-        if getattr(stamp, "tzinfo", None) is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - stamp <= self._TIMER_ANCHOR_WINDOW
 
     @staticmethod
     def _skip_action(player) -> str | None:
@@ -2931,8 +2477,31 @@ class GameApplication:
         if event.session.session_type not in {SessionType.C2C, SessionType.DIRECT}:
             raise GameRuleError("夜间行动请私聊机器人")
 
+    @staticmethod
+    def _reject_if_dead(room: GameRoom, event: PlatformEvent, command: Command) -> None:
+        """出局玩家在本局内不再参与游戏（用户需求第四条）。
+
+        领域层各个动作本来就会各自校验存活，这里再加一道统一闸门：
+        死者发来的任何操作类指令都直接拒掉，不进状态机、不占用行动名额，
+        也不会因为某个动作忘了校验而漏出去。查询类指令照常放行。
+        """
+        if room.phase in {GamePhase.LOBBY, GamePhase.FINISHED, GamePhase.CANCELLED}:
+            return
+        if command.name in _DEAD_ALLOWED_COMMANDS:
+            return
+        player = next((item for item in room.players if item.user_id == event.user_id), None)
+        if player is None or player.alive:
+            return
+        raise GameRuleError("你已经出局，本局不能再进行任何操作。")
+
     def _is_admin(self, event: PlatformEvent) -> bool:
-        return event.user_id in self.admin_user_ids or event.user_id in self.dev_user_ids
+        # OneBot 群消息会带 sender.role；优先使用实时群角色，
+        # 静态白名单继续作为私聊、测试和平台未提供角色时的兜底。
+        group_admin = (
+            event.session.session_type == SessionType.GROUP
+            and str(event.group_role or "").casefold() in {"owner", "admin"}
+        )
+        return group_admin or event.user_id in self.admin_user_ids or event.user_id in self.dev_user_ids
 
     def _may_start(self, room: GameRoom, event: PlatformEvent) -> bool:
         """判断这条 /startgame 能不能当作「立刻开局」处理。
@@ -2958,16 +2527,14 @@ class GameApplication:
         self, events: Iterable[DomainEvent], room: GameRoom, source: PlatformEvent
     ) -> list[OutboundMessage]:
         messages: list[OutboundMessage] = []
-        # 记住这条群消息，供后续定时器播报复用回复锚点。
-        self._remember_group_anchor(room, source)
-        # 同一会话内的批内序号：让「同一 msg_id 回复多条」时每条 delivery_id 不同，
-        # 入库后再由 deliveries.msg_seq 递增满足 QQ 官方的被动回复要求。
+        # 局内状态一有变化就把群名片同步过去（开局铺号码、出局标已出局、终局清空）。
+        await self._sync_cards(room)
+        # 同一会话内的批内序号：让「同一条消息回复多条」时每条 delivery_id 不同。
         counters: dict[str, int] = {}
-        # 记录这一批里「私聊通道还没开通」的玩家，收尾时点名引导 /link。
-        unlinked: list[str] = []
         for domain_event in events:
-            requires_anchor = False
-            if domain_event.public:
+            # QQ 版投票确认按当前玩法在群里播报；领域事件仍保留官方的私聊目标，便于其他平台复用。
+            broadcast_vote = domain_event.kind == "vote_accepted" and room.phase == GamePhase.VOTE
+            if domain_event.public or broadcast_vote:
                 target = PlatformSession(SessionType.GROUP, room.session_id)
                 reply_to = None
                 event_id = None
@@ -2989,9 +2556,6 @@ class GameApplication:
                 target = private.session
                 reply_to = private.reply_to
                 event_id = private.event_id
-                requires_anchor = private.requires_anchor
-                if requires_anchor and domain_event.target_user_id not in unlinked:
-                    unlinked.append(domain_event.target_user_id)
             index = counters.get(target.key, 0)
             counters[target.key] = index + 1
             messages.append(
@@ -3003,10 +2567,8 @@ class GameApplication:
                     source_event_id=source.event_id,
                     event_id=event_id,
                     sequence=index,
-                    requires_anchor=requires_anchor,
                 )
             )
-        self._append_private_delivery_hint(messages, source, room, unlinked)
         TRACE.record(
             room.session_id,
             "消息生成",
@@ -3014,53 +2576,6 @@ class GameApplication:
             事件数=len(messages),
         )
         return messages
-
-    def _append_private_delivery_hint(
-        self,
-        messages: list[OutboundMessage],
-        source: PlatformEvent,
-        room: GameRoom,
-        unlinked: Iterable[str] = (),
-    ) -> None:
-        """群里开局却发不出身份时，点名告诉这些玩家怎么开通私聊通道。
-
-        以前只给一句通用文案，玩家看完仍然不知道「是谁没收到」，也不知道
-        「我明明加了机器人为什么还不行」。现在把没开通的人按座位号列出来，
-        并给出 /link 这条唯一能真正解决问题的路径。
-        """
-        if source.session.session_type != SessionType.GROUP:
-            return
-        pending = [item for item in unlinked]
-        if not pending:
-            # 兜底：没有显式标记时，仍按「私聊消息且没有任何锚点」判断。
-            missing = [
-                item
-                for item in messages
-                if item.target.session_type in {SessionType.C2C, SessionType.DIRECT}
-                and not item.reply_to
-                and not (item.event_id and not str(item.event_id).startswith("timer:"))
-            ]
-            if not missing:
-                return
-            names = ""
-        else:
-            index = {player.user_id: player for player in room.players}
-            labels = [
-                index[user_id].list_label for user_id in pending if user_id in index
-            ]
-            names = ("\n" + "\n".join(labels)) if labels else ""
-        messages.append(
-            self._reply(
-                source,
-                "身份和夜间行动只发到私聊，以下玩家还没开通私聊通道：" + names + "\n"
-                "开通方法（只需一次）：在本群发送 /link 领取 6 位关联码，"
-                "再私聊机器人发送「/link 关联码」即可。\n"
-                "说明：QQ 给同一个人在群里和私聊里分配的是两个不同的标识，"
-                "官方没有换算接口，所以只把机器人拉进群或在资料页点添加仍会提示"
-                "「无好友关系」。关联完成后，之前卡住的身份牌会自动补发。",
-                room_id=room.session_id,
-            )
-        )
 
     @staticmethod
     def _reply(event: PlatformEvent, text: str, *, room_id: str | None = None) -> OutboundMessage:
@@ -3076,8 +2591,8 @@ class GameApplication:
     def _split_messages(self, messages: Iterable[OutboundMessage]) -> list[OutboundMessage]:
         """按长度切片，并给同一会话的每条消息编批内序号。
 
-        切片后的第二段以后过去会被摘掉 reply_to / event_id，导致长文案只发得出第一段。
-        现在全部保留锚点，由 deliveries.msg_seq 保证官方要求的递增 msg_seq。
+        批内序号只用来区分 delivery_id，保证「一条来源消息拆成多段」时每段
+        都是独立的投递记录；NapCat 可以主动发消息，不需要任何回复锚点。
         """
         result: list[OutboundMessage] = []
         counters: dict[str, int] = {}
@@ -3098,7 +2613,6 @@ class GameApplication:
                         source_event_id=message.source_event_id,
                         event_id=message.event_id,
                         sequence=index,
-                        requires_anchor=message.requires_anchor,
                     )
                 )
         # Program.cs:260 messagesTx —— 每条实际投递的消息计一次。
@@ -3141,7 +2655,7 @@ class GameApplication:
             GamePhase.CANCELLED: "已取消",
         }
         roster = "、".join(
-            p.list_label for p in GameApplication._roster_players(room)
+            p.short_label for p in GameApplication._roster_players(room)
         )
         if room.phase == GamePhase.LOBBY:
             # Werewolf.cs:1376 —— joining 阶段只播报总人数，且不做随机排序。
@@ -3213,10 +2727,10 @@ class GameApplication:
             Team.TANNER: "坦纳", Team.NO_ONE: "无人",
         }
         if room.rules.show_roles_end == "None":
-            lines.extend(player.list_label for player in room.players)
+            lines.extend(player.short_label for player in room.players)
         elif room.rules.show_roles_end == "All":
             lines.extend(
-                f"{player.list_label}："
+                f"{player.short_label}："
                 f"{role_display_name(player.role) if player.role else '未知'}，"
                 f"{'存活' if player.alive else '出局'}，"
                 f"{team_names.get(player.team, player.team.value if player.team else '未知阵营')}，"
@@ -3225,7 +2739,7 @@ class GameApplication:
             )
         else:
             lines.extend(
-                f"{player.list_label}："
+                f"{player.short_label}："
                 f"{role_display_name(player.role) if player.role else '未知'}，"
                 f"{team_names.get(player.team, player.team.value if player.team else '未知阵营')}，"
                 f"{'胜利' if player.won else '失败'}"

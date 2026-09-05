@@ -232,10 +232,10 @@ def test_official_lobby_rejects_reserved_join_names(display_name: str) -> None:
 
 @pytest.mark.parametrize("display_name", ["", " ", " \n "])
 def test_lobby_accepts_empty_display_name(display_name: str) -> None:
-    """QQ 群消息大多不下发昵称，空名是常态：必须放行，展示层用座位号兜底。
+    """QQ 群消息偶尔取不到昵称，空名是常态：必须放行，展示层用座位号兜底。
 
     这一条是本项目相对官方 C# 版的有意偏离——官方运行在 Telegram 上，昵称必定
-    存在；QQ 开放平台只给 openid，把空名当错误会让绝大多数玩家直接进不来。
+    存在；NapCat 侧 sender.nickname 可能为空，把空名当错误会让玩家直接进不来。
     """
     engine, _ = _lobby_engine()
     room = engine.create_room("qq-empty-name", ruleset_official())
@@ -244,7 +244,7 @@ def test_lobby_accepts_empty_display_name(display_name: str) -> None:
 
     assert [player.user_id for player in room.players] == ["u1"]
     assert room.players[0].display_name == ""
-    # 展示层绝不外泄 openid，退化成座位号。
+    # 展示层绝不外泄 QQ 号，退化成座位号。
     assert room.players[0].public_name == "1号"
     assert room.players[0].nickname == "1号玩家"
 

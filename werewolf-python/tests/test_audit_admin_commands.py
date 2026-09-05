@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from adapters.qq.events import normalize_c2c_message, normalize_group_message
+from adapters.napcat.events import normalize_group_message, normalize_private_message
 from application.contracts import PlatformEvent
 from application.service import GameApplication
 from domain.achievements import Achievement
@@ -87,9 +87,6 @@ class AdminStore:
             room for room in self.rooms.values()
             if any(p.user_id == user_id for p in room.players)
         ]
-
-    async def get_direct_session(self, _user_id):
-        return None
 
     async def get_group_rule_config(self, _group_id):
         return {}
@@ -166,20 +163,24 @@ def make_app(rooms=(), admins=("adm",), devs=("dev",)):
 
 def group_event(content, *, user="dev", name=None, group="g1", event_id=None) -> PlatformEvent:
     return normalize_group_message({
-        "id": event_id or f"evt-{next(_ids)}",
-        "group_openid": group,
-        "content": content,
-        "timestamp": "2026-09-01T00:00:00+00:00",
-        "author": {"member_openid": user, "username": name or f"玩家{user}"},
+        "message_id": event_id or f"evt-{next(_ids)}",
+        "group_id": group,
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": 1767225600,
+        "sender": {"user_id": user, "nickname": name or f"玩家{user}", "role": "member"},
     })
 
 
 def c2c_event(content, *, user="dev", name=None, event_id=None) -> PlatformEvent:
-    return normalize_c2c_message({
-        "id": event_id or f"evt-{next(_ids)}",
-        "content": content,
-        "timestamp": "2026-09-01T00:00:00+00:00",
-        "author": {"user_openid": user, "username": name or f"玩家{user}"},
+    return normalize_private_message({
+        "message_id": event_id or f"evt-{next(_ids)}",
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": 1767225600,
+        "sender": {"user_id": user, "nickname": name or f"玩家{user}"},
     })
 
 
@@ -496,9 +497,8 @@ def test_whois_known_player():
         "first_seen": NOW, "games": 3, "first_game": NOW,
     }
     text = texts(run(app.handle_event(group_event("/whois u2"))))
-    # 统一身份格式「qq号：xxx｜昵称：yyy」；没绑定真号时给短内部号，
-    # 不再把完整 openid 原样回显。
-    assert "阿狼" in text and "qq号：" in text and "昵称：" in text
+    # 管理命令统一身份格式「QQ 号：xxx｜昵称：yyy」；NapCat 下没有内部标识可言。
+    assert "阿狼" in text and "QQ 号：" in text and "昵称：" in text
 
 
 def test_notifyban_and_notifyspam_go_to_private():

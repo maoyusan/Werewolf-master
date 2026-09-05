@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from adapters.qq.events import normalize_c2c_message, normalize_group_message
+from adapters.napcat.events import normalize_group_message, normalize_private_message
 from application.contracts import PlatformEvent
 from application.service import GameApplication
 from domain.achievements import Achievement
@@ -71,9 +71,6 @@ class DevStore:
     async def find_active_rooms_for_user(self, user_id):
         return []
 
-    async def get_direct_session(self, _user_id):
-        return None
-
     async def get_group_rule_config(self, _group_id):
         return {}
 
@@ -115,20 +112,24 @@ def make_app(devs=("dev",)):
 
 def group_event(content, *, user="dev", group="g1") -> PlatformEvent:
     return normalize_group_message({
-        "id": f"evt-{next(_ids)}",
-        "group_openid": group,
-        "content": content,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "author": {"member_openid": user, "username": f"玩家{user}"},
+        "message_id": f"evt-{next(_ids)}",
+        "group_id": group,
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": int(datetime.now(timezone.utc).timestamp()),
+        "sender": {"user_id": user, "nickname": f"玩家{user}", "role": "member"},
     })
 
 
 def c2c_event(content, *, user="dev") -> PlatformEvent:
-    return normalize_c2c_message({
-        "id": f"evt-{next(_ids)}",
-        "content": content,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "author": {"user_openid": user, "username": f"玩家{user}"},
+    return normalize_private_message({
+        "message_id": f"evt-{next(_ids)}",
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": int(datetime.now(timezone.utc).timestamp()),
+        "sender": {"user_id": user, "nickname": f"玩家{user}"},
     })
 
 
@@ -241,9 +242,10 @@ def test_test_command_reports_usage_per_month():
 
 
 def test_test_command_only_replies_once_per_session():
-    """同一条事件的多条回复全部保留被动回复锚点，靠 msg_seq 递增区分。
+    """同一条事件拆出的多条回复共享同一个 source_event_id，靠批内序号区分。
 
-    旧实现把第二条起降级成主动推送，QQ 侧经常直接拦截，玩家看不到后半段。
+    序号只用来分配 delivery_id，保证每段都是独立的投递记录；NapCat 可以
+    主动发消息，不需要任何回复锚点。
     """
     app, store = make_app()
     store.month_rows = []
@@ -368,8 +370,8 @@ def test_moveachv_requires_a_user_id():
 def test_moveachv_reports_unknown_player():
     app, _ = make_app()
     messages = run(app.handle_event(group_event("/moveachv u404")))
-    # 查无此人时也不回显完整 openid，只给短内部号。
-    assert texts(messages) == ["数据库里找不到玩家 内部号u404。"]
+    # NapCat 下 user_id 就是真实 QQ 号，管理命令直接回显它。
+    assert texts(messages) == ["数据库里找不到 QQ 号 u404 对应的玩家。"]
 
 
 def test_moveachv_reports_no_legacy_records():
@@ -377,7 +379,7 @@ def test_moveachv_reports_no_legacy_records():
     app, store = make_app()
     store.players["u1"] = {"user_id": "u1", "name": "甲"}
     messages = run(app.handle_event(group_event("/moveachv u1")))
-    assert texts(messages) == ["玩家 qq号：内部号u1｜昵称：甲 没有可迁移的旧成就记录。"]
+    assert texts(messages) == ["玩家 QQ 号：u1｜昵称：甲 没有可迁移的旧成就记录。"]
 
 
 # ---------------------------------------------------------------------------

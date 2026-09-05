@@ -13,7 +13,7 @@ python -m pytest tests/test_official_parity.py tests/test_parity.py tests/test_a
 python -m pytest -q
 ```
 
-本次记录结果：官方对照 `200 passed`；定向验收 `238 passed`；全量 `586 passed`；三个命令退出状态均为 `0`。
+本次记录结果（2026-09-05）：官方对照 `202 passed`；定向验收 `257 passed`；全量 `621 passed`，退出状态均为 `0`。
 
 ## 已闭环的规则
 

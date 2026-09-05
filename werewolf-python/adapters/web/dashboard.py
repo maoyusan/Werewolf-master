@@ -11,7 +11,8 @@
 - `infrastructure.observability.TRACE`：进程内流程埋点，覆盖数据库里看不到的
   「走到这里就返回了」的分支。
 
-页面全部只读：不提供任何会改动游戏状态的接口，误点也不会影响正在进行的对局。
+页面对局数据保持只读，误点不会影响正在进行的对局。异常投递区允许把
+失败/重试记录判死并移出列表，方便清掉已经看过、不会再成功的发送失败。
 所有 handler 都用 try/except 兜住，观测页出错只会在 JSON 里返回中文错误说明，
 绝不把异常传导回机器人主流程。
 """
@@ -37,7 +38,6 @@ from domain.models import (
     QuestionType,
     Role,
     Team,
-    qq_short_id,
 )
 from domain.roleinfo import role_display_name
 from infrastructure.observability import TRACE
@@ -147,7 +147,6 @@ DELIVERY_STATUS_NAMES: dict[str, str] = {
     "sent": "已送达",
     "failed": "失败",
     "retry": "重试中",
-    "waiting": "等待回复锚点",
     "dead": "已判死",
 }
 
@@ -201,16 +200,14 @@ def _action_name(action: str | None) -> str:
 
 
 def _short_id(user_id: str | None) -> str:
-    """QQ 的 openid 是 32 位十六进制，观测页只留前 8 位方便肉眼比对。
+    """观测页里展示的用户标识。
 
-    统一走 domain.models.qq_short_id，保证后台看到的短码和群里
-    /whoami、show_ids 显示的「内部号」是同一串，方便交叉核对。
+    NapCat 下 user_id 就是真实 QQ 号，本来就短，直接原样展示即可；
+    观测页是运维自用的只读页面，不受「群内不展示 QQ 号」那条约束。
     """
     if not user_id:
         return "—"
-    text = str(user_id)
-    short = qq_short_id(text)
-    return short if short == text else f"{short}…"
+    return str(user_id)
 
 
 def _player_name(room: GameRoom, user_id: str | None) -> str:
@@ -218,7 +215,7 @@ def _player_name(room: GameRoom, user_id: str | None) -> str:
         return "—"
     for player in room.players:
         if player.user_id == user_id:
-            return player.list_label
+            return player.short_label
     return _short_id(user_id)
 
 
@@ -336,8 +333,7 @@ def _player_view(room: GameRoom, player: Player) -> dict[str, Any]:
     return {
         "座位": player.seat,
         "昵称": player.nickname,
-        "QQ号": player.qq_id,
-        "内部号": _short_id(player.user_id),
+        "QQ号": player.user_id,
         "身份": _role_name(player.role),
         "初始身份": _role_name(player.original_role) if player.original_role else "—",
         "阵营": _team_name(player.team),
@@ -364,18 +360,18 @@ def _vote_view(room: GameRoom) -> dict[str, Any]:
             target = room.votes.get(player.user_id)
             cast.append(
                 {
-                    "投票人": player.list_label,
+                    "投票人": player.short_label,
                     "投给": "弃票" if target is None else _player_name(room, target),
                     "票重": player.vote_weight,
                 }
             )
             if target is None:
-                skipped.append(player.list_label)
+                skipped.append(player.short_label)
             else:
                 name = _player_name(room, target)
                 tally[name] = tally.get(name, 0) + max(1, player.vote_weight)
         elif player.alive:
-            not_voted.append(player.list_label)
+            not_voted.append(player.short_label)
     ranked = sorted(tally.items(), key=lambda item: item[1], reverse=True)
     return {
         "轮次": room.vote_round,
@@ -396,7 +392,7 @@ def _night_view(room: GameRoom) -> dict[str, Any]:
         if actions:
             submitted.append(
                 {
-                    "玩家": player.list_label,
+                    "玩家": player.short_label,
                     "身份": _role_name(player.role),
                     "动作": "；".join(_describe_action(room, action) for action in actions),
                 }
@@ -411,7 +407,7 @@ def _night_view(room: GameRoom) -> dict[str, Any]:
             continue
         missing.append(
             {
-                "玩家": player.list_label,
+                "玩家": player.short_label,
                 "身份": _role_name(player.role),
                 "应做": "、".join(_action_name(action.value) for action in expected),
             }
@@ -442,7 +438,7 @@ def _waiting_for(room: GameRoom) -> list[dict[str, Any]]:
             waiting.append(
                 {
                     "座位": player.seat,
-                    "玩家": player.list_label,
+                    "玩家": player.short_label,
                     "缺少操作": "私聊提交：" + "、".join(
                         _action_name(action.value) for action in expected
                     ),
@@ -453,7 +449,7 @@ def _waiting_for(room: GameRoom) -> list[dict[str, Any]]:
         for player in room.players:
             if player.alive and not player.fled and player.user_id not in room.votes:
                 waiting.append(
-                    {"座位": player.seat, "玩家": player.list_label, "缺少操作": "提交处决投票"}
+                    {"座位": player.seat, "玩家": player.short_label, "缺少操作": "提交处决投票"}
                 )
         return waiting
     return waiting
@@ -528,8 +524,7 @@ def _diagnose(
                 f"该房间有 {len(room_failed)} 条出站消息处于 failed/重试状态，"
                 f"最近一条错误：{reason}。机器人「发了消息却没反应」通常就卡在这里，"
                 "请看下方「异常投递」卡片。"
-                "（已确认无法投递的记录会转为「已判死」，不会再计入这里反复告警；"
-                "等待被动回复锚点的记录状态是「等待回复锚点」，会在该会话下一条消息到达时自动补发。）"
+                "（已确认无法投递的记录会转为「已判死」，不会再计入这里反复告警。）"
             ),
         }
     if room.phase in {GamePhase.FINISHED, GamePhase.CANCELLED}:
@@ -585,14 +580,13 @@ def _room_view(
     remaining = _remaining_seconds(room)
     waiting = _waiting_for(room)
     alive = [player for player in room.players if player.alive]
-    # 私聊事件只存了 openid，直接显示既不可读也是内部标识外泄；
-    # 这里统一映射成「座位号 + QQ号 + 昵称」，查不到才退化成短内部号。
+    # 定向私聊事件只记了 user_id，这里映射成「座位号 + 昵称」方便肉眼对人。
     for item in events:
         target = item.get("定向用户")
         item["定向玩家"] = _player_name(room, str(target)) if target else ""
     return {
-        # 「房间号」是内部主键，前端拿它做锚点和详情路由，必须保持完整；
-        # 「群号」只用于卡片标题展示，压成短码，不把 32 位 openid 摊在页面上。
+        # 「房间号」就是群号（NapCat 下 session_id 即 group_id），
+        # 前端拿它做列表 key 和详情路由，两处都保持完整。
         "房间号": room.session_id,
         "群号": _short_id(room.session_id),
         "房间状态": _phase_name(room.phase),
@@ -731,10 +725,8 @@ async def _build_snapshot(runtime: Any) -> dict[str, Any]:
             "排队中": sum(
                 queue_summary.get(status, 0) for status in ("pending", "sending", "retry")
             ),
-            # waiting 是「等同会话下一条真实消息来补回复锚点」的挂起态，
-            # dead 是已确认不可能成功（无权限/等锚点超时）的记录：
-            # 两者都不该混进「失败投递数」去反复告警，但要能单独看到条数。
-            "等待锚点": queue_summary.get("waiting", 0),
+            # dead 是已确认不可能成功（目标不合法、被永久拒绝）的记录：
+            # 不该混进「失败投递数」去反复告警，但要能单独看到条数。
             "已判死": queue_summary.get("dead", 0),
             "失败投递数": len(failed),
             "最近成功投递": last_sent,
@@ -830,6 +822,28 @@ async def _api_observe_room(request: web.Request) -> web.Response:
         )
 
 
+async def _api_clear_failed(request: web.Request) -> web.Response:
+    """把失败/重试中的投递判死。不改对局状态，只停掉已经没希望的重试。"""
+    try:
+        store = request.app["runtime"].store
+        clearer = getattr(store, "clear_failed_deliveries", None)
+        if not callable(clearer):
+            return web.json_response(
+                {"错误": ["当前存储不支持清除异常投递"]},
+                status=501,
+                dumps=_dumps,
+            )
+        cleared = int(await clearer())
+        return web.json_response({"已清除": cleared}, dumps=_dumps)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("观测页清除异常投递失败")
+        return web.json_response(
+            {"错误": [f"清除异常投递失败：{exc}"]},
+            status=500,
+            dumps=_dumps,
+        )
+
+
 async def _push_loop(
     ws: web.WebSocketResponse, runtime: Any, queue: "asyncio.Queue[dict[str, Any]]"
 ) -> None:
@@ -899,12 +913,13 @@ def setup_dashboard(app: web.Application) -> None:
     """把观测页的路由挂到已有的 aiohttp 应用上。
 
     调用方需要保证 `app["runtime"]` 已经是 Runtime 实例（main.py 里已经这么做）。
-    这里注册的全部是只读接口，不会改动任何游戏状态。
+    快照与实时通道只读；另提供清除异常投递，不会改写正在进行的对局。
     """
 
     app[_WS_KEY] = set()
     app.router.add_get("/dashboard", _dashboard_page)
     app.router.add_get("/api/observe", _api_observe)
+    app.router.add_post("/api/observe/failed/clear", _api_clear_failed)
     app.router.add_get("/api/observe/{room_id}", _api_observe_room)
     app.router.add_get("/ws/observe", _ws_observe)
     app.on_shutdown.append(_close_websockets)
@@ -914,7 +929,8 @@ def setup_dashboard(app: web.Application) -> None:
 # 页面（纯原生 HTML + CSS + JS，不引任何外部资源）
 # ----------------------------------------------------------------------
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+# 必须用 raw 字符串：普通三引号会把 JS 里的 '\n' 变成真换行，整页脚本直接语法错误。
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
@@ -1042,9 +1058,19 @@ main{padding:var(--space-3);display:flex;flex-direction:column;gap:var(--space-3
 .metric.warn b{color:var(--warn);}
 .card{background:var(--card);border:1px solid var(--line-soft);border-radius:var(--r-lg);
   overflow:hidden;box-shadow:var(--shadow);}
+main > section{display:none;}
+main > section.is-active{display:block;}
 .card>h2,.card-head{margin:0;padding:12px var(--space-2);font-size:var(--text-14);
   font-weight:600;background:var(--panel);border-bottom:1px solid var(--line-soft);
-  display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);}
+  display:flex;justify-content:space-between;align-items:center;gap:var(--space-2);
+  flex-wrap:wrap;}
+.btn-clear{min-height:40px;padding:0 12px;border-radius:var(--r-sm);font:inherit;
+  font-size:var(--text-12);font-weight:600;cursor:pointer;flex-shrink:0;
+  border:1px solid var(--err-line);background:var(--err-bg);color:var(--err);
+  transition:background var(--dur) var(--ease),color var(--dur) var(--ease),
+  opacity var(--dur) var(--ease);}
+.btn-clear:hover:not(:disabled){background:var(--err);color:var(--fg);}
+.btn-clear:disabled{opacity:.45;cursor:not-allowed;}
 .card>h2 .muted,.card-head .muted{font-weight:400;font-size:var(--text-12);
   font-variant-numeric:tabular-nums;color:var(--dim);}
 .card>.body{padding:var(--space-2);}
@@ -1117,7 +1143,7 @@ ul.log time{color:var(--dim);white-space:nowrap;flex-shrink:0;
 .tag.evt{color:var(--evt);border-color:var(--evt-line);background:var(--evt-bg);}
 .tag.trc{color:var(--ok);border-color:var(--ok-line);background:var(--ok-bg);}
 .st-sent{color:var(--ok);} .st-failed{color:var(--err);font-weight:700;}
-.st-waiting{color:var(--warn);} .st-dead{color:var(--dim);text-decoration:line-through;}
+.st-dead{color:var(--dim);text-decoration:line-through;}
 .st-retry{color:var(--warn);} .st-pending{color:var(--muted);} .st-sending{color:var(--tip);}
 .count{font-variant-numeric:tabular-nums;font-weight:700;}
 .alert{display:flex;gap:10px;align-items:flex-start;background:var(--err-bg);
@@ -1175,7 +1201,7 @@ html{overflow-x:hidden;}
     </div>
   </div>
   <nav class="nav" aria-label="页内分区">
-    <a href="#overview" id="nav-overview">
+    <a href="#overview" id="nav-overview" aria-current="page">
       <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>
       总览
     </a>
@@ -1208,7 +1234,7 @@ html{overflow-x:hidden;}
   </header>
   <main id="main">
     <div id="errors"></div>
-    <section id="overview" aria-labelledby="overview-title">
+    <section id="overview" class="is-active" aria-labelledby="overview-title">
       <div class="section-head">
         <h2 id="overview-title">服务健康</h2>
         <p>只读快照字段，不探测数据库</p>
@@ -1226,7 +1252,6 @@ html{overflow-x:hidden;}
         <article class="metric"><span>活跃对局</span><b id="s-rooms">0</b></article>
         <article class="metric"><span>玩家（存活 <i id="s-alive">0</i>）</span><b id="s-players">0</b></article>
         <article class="metric"><span>排队中</span><b id="s-queue">0</b></article>
-        <article class="metric" id="st-waiting"><span>等待锚点</span><b id="s-waiting">0</b></article>
         <article class="metric" id="st-failed"><span>失败投递</span><b id="s-failed">0</b></article>
         <article class="metric"><span>已判死</span><b id="s-dead">0</b></article>
       </div>
@@ -1253,7 +1278,12 @@ html{overflow-x:hidden;}
     </section>
     <section id="failed" aria-labelledby="failed-title">
       <div class="card">
-        <h2 id="failed-title">异常投递<span class="muted">定位消息发出去却没反应</span></h2>
+        <h2 id="failed-title">
+          <span>异常投递<span class="muted">定位消息发出去却没反应</span></span>
+          <button type="button" class="btn-clear" id="btn-clear-failed" disabled
+            onclick="clearFailed()"
+            title="把失败和重试中的投递判死，停止重试并移出本列表">清除</button>
+        </h2>
         <div class="body" id="gfailed"><div class="empty">正在读取投递队列。</div></div>
       </div>
     </section>
@@ -1261,7 +1291,9 @@ html{overflow-x:hidden;}
 </div>
 </div>
 <script>
-var state = { snap:null, live:[], recvAt:0, lastErrKey:'', channelKind:'wait', channelText:'正在连接实时通道' };
+var state = { snap:null, live:[], recvAt:0, lastErrKey:'', channelKind:'wait',
+  channelText:'正在连接实时通道', clearing:false };
+var VIEWS = ['overview','rooms','logs','failed'];
 var ICO = {
   ok:'<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12.4l2.6 2.6L16.4 9"/></svg>',
   tip:'<svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><circle cx="12" cy="8" r=".8" fill="currentColor" stroke="none"/></svg>',
@@ -1322,10 +1354,8 @@ function renderTop(s){
   document.getElementById('s-players').textContent = o['总玩家数']||0;
   document.getElementById('s-alive').textContent = o['存活玩家数']||0;
   document.getElementById('s-queue').textContent = b['排队中']||0;
-  var waiting = b['等待锚点']||0, failed = b['失败投递数']||0;
-  document.getElementById('s-waiting').textContent = waiting;
+  var failed = b['失败投递数']||0;
   document.getElementById('s-failed').textContent = failed;
-  document.getElementById('st-waiting').className = 'metric' + (waiting ? ' warn' : '');
   document.getElementById('st-failed').className = 'metric' + (failed ? ' bad' : '');
   document.getElementById('s-dead').textContent = b['已判死']||0;
   document.getElementById('nav-rooms').textContent = o['活跃对局']||0;
@@ -1344,6 +1374,7 @@ function renderTop(s){
   document.getElementById('s-time').textContent = '快照 '+full(s['生成时间']);
   renderErrors(s['错误']||[]);
   setChip('h-ch', state.channelKind, '实时通道', state.channelText);
+  syncClearBtn();
 }
 function tableOf(cols, rows, rowClass, tableClass){
   if(!rows || !rows.length) return '<div class="empty">暂无数据</div>';
@@ -1445,14 +1476,14 @@ function mergedLog(room){
       '</span><span class="log-text">'+esc(i.text)+'</span></li>'; }).join('')+'</ul>';
 }
 var DSTATUS = {pending:'待发送', sending:'发送中', sent:'已送达', failed:'失败',
-  retry:'重试中', waiting:'等待回复锚点', dead:'已判死'};
+  retry:'重试中', dead:'已判死'};
 function deliveryTable(rows){
   return tableOf([
     ['时间', function(d){ return t(d['创建时间']); }],
     ['状态', function(d){ var s=d['状态']||'';
       return '<span class="st-'+esc(s)+'">'+esc(DSTATUS[s]||s)+'</span>'; }],
     ['序号', function(d){ return esc(d['消息序号']); }],
-    ['锚点', function(d){ return '<span class="mono">'+esc((d['回复锚点']||d['事件号']||'—').slice(0,10))+'</span>'; }],
+    ['引用', function(d){ return '<span class="mono">'+esc(String(d['回复锚点']||'—').slice(0,10))+'</span>'; }],
     ['内容', function(d){ return esc(d['内容']||''); }],
     ['次数', function(d){ return esc(d['尝试次数']); }],
     ['错误', function(d){ return '<span class="st-failed">'+esc(d['最近错误']||'')+'</span>'; }]
@@ -1554,22 +1585,60 @@ function tick(){
   }
 }
 setInterval(tick, 1000);
-function bindNav(){
-  var links = document.querySelectorAll('.nav a');
+function currentView(){
+  var h = (location.hash || '#overview').replace(/^#/, '');
+  return VIEWS.indexOf(h) >= 0 ? h : 'overview';
+}
+function showView(id){
+  if(VIEWS.indexOf(id) < 0) id = 'overview';
+  VIEWS.forEach(function(v){
+    var el = document.getElementById(v);
+    if(el) el.classList.toggle('is-active', v === id);
+  });
+  document.querySelectorAll('.nav a').forEach(function(a){
+    if(a.getAttribute('href') === '#'+id) a.setAttribute('aria-current','page');
+    else a.removeAttribute('aria-current');
+  });
   var root = document.querySelector('.workspace');
-  if(!('IntersectionObserver' in window) || !root) return;
-  var io = new IntersectionObserver(function(entries){
-    entries.forEach(function(e){
-      if(!e.isIntersecting) return;
-      links.forEach(function(a){
-        if(a.getAttribute('href') === '#'+e.target.id) a.setAttribute('aria-current','page');
-        else a.removeAttribute('aria-current');
-      });
+  if(root) root.scrollTop = 0;
+  if(window.scrollY) window.scrollTo(0, 0);
+}
+function bindNav(){
+  document.querySelectorAll('.nav a').forEach(function(a){
+    a.addEventListener('click', function(e){
+      var id = (a.getAttribute('href') || '').replace(/^#/, '');
+      if(VIEWS.indexOf(id) < 0) return;
+      e.preventDefault();
+      if(location.hash === '#'+id) showView(id);
+      else location.hash = id;
     });
-  }, { root: root, rootMargin:'-15% 0px -65% 0px', threshold:0.05 });
-  ['overview','rooms','logs','failed'].forEach(function(id){
-    var el = document.getElementById(id);
-    if(el) io.observe(el);
+  });
+  window.addEventListener('hashchange', function(){ showView(currentView()); });
+  showView(currentView());
+}
+function syncClearBtn(){
+  var btn = document.getElementById('btn-clear-failed');
+  if(!btn) return;
+  var n = ((state.snap || {})['异常投递'] || []).length;
+  btn.disabled = state.clearing || !n;
+  btn.textContent = state.clearing ? '正在清除' : '清除';
+}
+function clearFailed(){
+  var n = ((state.snap || {})['异常投递'] || []).length;
+  if(!n || state.clearing) return;
+  if(!confirm('将把当前 '+n+' 条失败或重试中的投递判死并移出本列表，确定清除？')) return;
+  state.clearing = true;
+  syncClearBtn();
+  fetch('/api/observe/failed/clear', {method:'POST'}).then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(function(){
+    fetchSnapshot(function(d){ applySnapshot(d); });
+  }).catch(function(){
+    renderErrors(['清除异常投递失败，请稍后重试。']);
+  }).then(function(){
+    state.clearing = false;
+    syncClearBtn();
   });
 }
 var ws = null, retry = 0, poller = null, wsTimer = null;

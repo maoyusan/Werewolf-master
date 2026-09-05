@@ -1,13 +1,14 @@
 # 死亡链 / 白天公布 / 投票 / 胜负 复刻审计分片
 
+> 复查说明（2026-09-05）：本文下方部分差异表保留了历史审计记录，`xfail` 及旧的测试数量不代表当前代码状态。当前工作区已移除这些 `xfail` 标记；请以 `python -m pytest -q` 的实时结果和 `docs/official-parity-checklist.md` 为准。
+
 独立复刻审计（openspec 变更 independent-official-parity-audit 任务 5.1–5.5、6.1–6.6）。
 官方期望值唯一来源：`work/upstream-official/Werewolf for Telegram`，提交 `ca547ccb0ed01e6f282f9e8e71f7a24d547b24d7`。
 
 - 官方主文件：`Werewolf Node/Werewolf.cs`（下表行号均指该文件，另有注明除外）
 - Python 主实现：`domain/engine.py`
-- 新增测试：`tests/test_audit_death_vote_win.py`（9 通过 + 12 strict xfail）
-- 本分片测试运行：`python -m pytest tests/test_audit_death_vote_win.py -q` → `9 passed, 12 xfailed`
-- 全量：`python -m pytest -q` → `312 passed, 29 xfailed`（无失败；xfail 全部 strict）
+- 新增测试：`tests/test_audit_death_vote_win.py`（当前收集 21 项，均通过）
+- 本分片 `python -m pytest tests/test_audit_death_vote_win.py -q` → `21 passed`；全量 `621 passed`。
 - 引用的既有测试位于 `tests/test_official_parity.py` / `tests/test_parity.py`，均可用 `-k <测试名>` 重跑，本次审计已重跑确认全部通过。
 - 差异编号本分片使用 `W-DIFF-01`–`W-DIFF-12`（其他分片使用 F-DIFF/Q-DIFF 前缀，无冲突）。
 
@@ -79,7 +80,7 @@
 
 - 总行数：61
 - 已通过：48
-- 已差异：12（W-DIFF-01 ~ W-DIFF-12，均有 strict xfail 测试）
+- 历史差异：12（W-DIFF-01 ~ W-DIFF-12）；对应测试当前已直接通过，编号仅作审计追溯。
 - 已确认未调用：0
 - 未决：1（W-DV-61，Spumpkin 自杀死因元数据；不影响可见行为，留待后续定夺）
 

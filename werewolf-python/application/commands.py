@@ -62,22 +62,6 @@ _ALIASES = {
     "getconfig": "config",
     "myidles": "myidles",
     "achv": "achv",
-    # QQ 开放平台只给机器人下发 openid，不下发真实 QQ 号，
-    # 玩家名单里要显示「qq号：xxx」就只能靠本人自助绑定。
-    "bindqq": "bind_qq",
-    "绑定qq": "bind_qq",
-    "绑定": "bind_qq",
-    "unbindqq": "unbind_qq",
-    "解绑qq": "unbind_qq",
-    "解绑": "unbind_qq",
-    "whoami": "whoami",
-    "我是谁": "whoami",
-    # QQ 群和单聊会给同一个人两个不同且不可互换的 openid，官方没有换算接口。
-    # /link 是把两者关联起来的一次性握手，关联完成前私聊身份牌根本发不出去。
-    "link": "link",
-    "开通私聊": "link",
-    "私聊": "link",
-    "绑定私聊": "link",
     "startgame": "create",
     "开始游戏": "create",
     "开局": "create",
@@ -204,7 +188,11 @@ _ALIASES = {
 
 def parse_command(text: str) -> Command:
     value = (text or "").strip()
-    value = re.sub(r"<@!?[A-Za-z0-9_:-]+>", "", value).strip()
+    # OneBot 的 CQ 码（[CQ:at,qq=123] 等）先整段剥掉：NapCat 版不要求 @Bot 才触发，
+    # 消息里带不带 @ 都不影响指令解析。
+    value = re.sub(r"\[CQ:[^\]]*\]", " ", value).strip()
+    # 兼容旧平台/客户端把提及编码成文本的写法：<@123>、<@!123>。
+    value = re.sub(r"<@!?[^>]+>", " ", value).strip()
     value = re.sub(r"^[/！!]", "", value).strip()
     if not value:
         return Command("help")

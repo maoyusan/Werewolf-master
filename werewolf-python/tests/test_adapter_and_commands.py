@@ -6,16 +6,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from adapters.qq.adapter import QQBotAdapter, _GROUP_PANEL_ITEMS
-from adapters.qq.events import (
-    normalize_c2c_message,
-    normalize_channel_message,
-    normalize_direct_message,
+from adapters.napcat.adapter import NapCatAdapter
+from adapters.napcat.events import (
+    message_text,
     normalize_group_message,
+    normalize_private_message,
 )
 from application.commands import parse_command
 from application.contracts import (
-    NeedsAnchorSendError,
+    PermanentSendError,
     PlatformEvent,
     PlatformSession,
     SessionType,
@@ -23,7 +22,7 @@ from application.contracts import (
 from application.service import GameApplication
 from domain.engine import GameRoomEngine, STALE_TIMEOUT_SECONDS
 from domain.models import DomainEvent, GamePhase, GameRoom, NightAction, Player, Role
-from domain.rules import ruleset_official
+from domain.rules import GameRuleError, ruleset_official
 from infrastructure.config import Settings
 from infrastructure.db import DeliveryRecord, PostgreSQLStore
 
@@ -59,9 +58,6 @@ class InMemoryRoomStore:
             self.snapshots[room.session_id] = room.snapshot()
         self.committed.append((room, list(messages)))
 
-    async def get_direct_session(self, _user_id: str) -> None:
-        return None
-
     async def delete_room(self, session_id: str) -> None:
         self.snapshots.pop(session_id, None)
 
@@ -88,6 +84,37 @@ class InMemoryGroupConfigPool:
         self.values[group_id] = rules_json
 
 
+class FakePlatform:
+    """NapCat 适配器的最小替身：只提供应用层用到的三种群能力。"""
+
+    def __init__(self, *, admin: bool = True):
+        self.admin = admin
+        self.cards: list[tuple[str, str, str]] = []
+
+    async def is_group_admin(self, _group_id: str) -> bool:
+        return self.admin
+
+    async def set_group_card(self, group_id: str, user_id: str, card: str) -> bool:
+        self.cards.append((group_id, user_id, card))
+        return True
+
+
+def _group_payload(text: str, *, user: str = "10001", group: str = "20001", **overrides) -> dict:
+    payload = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 1001,
+        "group_id": int(group),
+        "user_id": int(user),
+        "time": 1767225600,
+        "raw_message": text,
+        "message": [{"type": "text", "data": {"text": text}}],
+        "sender": {"user_id": int(user), "nickname": "沉潜", "card": "1号", "role": "member"},
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_parse_core_and_role_commands() -> None:
     assert parse_command("加入").name == "join"
     assert parse_command("/投票 3").name == "vote"
@@ -97,11 +124,11 @@ def test_parse_core_and_role_commands() -> None:
     assert parse_command("未知指令").name == "unknown"
 
 
-def test_group_panel_names_parse_to_known_commands() -> None:
-    assert 1 <= len(_GROUP_PANEL_ITEMS) <= 20
-    for item in _GROUP_PANEL_ITEMS:
-        parsed = parse_command(item["name"])
-        assert parsed.name != "unknown", item["name"]
+def test_parse_command_strips_cq_codes_so_at_is_optional() -> None:
+    """NapCat 版不要求 @Bot：带不带 @ 都必须解析成同一条指令。"""
+    assert parse_command("[CQ:at,qq=10000] /join").name == "join"
+    assert parse_command("[CQ:at,qq=10000]加入").name == "join"
+    assert parse_command("加入").name == "join"
 
 
 def test_parse_official_game_start_commands() -> None:
@@ -126,27 +153,25 @@ def test_parse_official_helper_commands() -> None:
 def test_private_step_action_can_select_reselect_and_cancel() -> None:
     app = GameApplication(object())
     room = GameRoom(
-        session_id="group-1",
+        session_id="20001",
         rules=ruleset_official(),
         phase=GamePhase.NIGHT,
         day=1,
         players=[
-            Player("u1", "丘比特", 1, role=Role.CUPID),
-            Player("u2", "甲", 2, role=Role.VILLAGER),
-            Player("u3", "乙", 3, role=Role.VILLAGER),
+            Player("10001", "丘比特", 1, role=Role.CUPID),
+            Player("10002", "甲", 2, role=Role.VILLAGER),
+            Player("10003", "乙", 3, role=Role.VILLAGER),
         ],
     )
     event = PlatformEvent(
         event_id="step-1",
-        session=PlatformSession(SessionType.C2C, "u1"),
-        user_id="u1",
+        session=PlatformSession(SessionType.C2C, "10001"),
+        user_id="10001",
         display_name="丘比特",
         text="/cupid",
     )
     prompt = app._begin_pending_action(room, event, "cupid")
     assert "第 1/1 个目标" in prompt[0].text
-
-    import asyncio
 
     selected = asyncio.run(app._continue_pending_action(room, event, parse_command("2")))
     assert selected is not None and "发送“确认”提交" in selected[0].text
@@ -165,23 +190,23 @@ def test_room_snapshot_restores_deadline_actions_and_pending_choice() -> None:
         phase=GamePhase.NIGHT,
         day=3,
         players=[
-            Player("u1", "丘比特", 1, role=Role.CUPID),
-            Player("u2", "甲", 2, role=Role.VILLAGER),
-            Player("u3", "乙", 3, role=Role.VILLAGER),
+            Player("10001", "丘比特", 1, role=Role.CUPID),
+            Player("10002", "甲", 2, role=Role.VILLAGER),
+            Player("10003", "乙", 3, role=Role.VILLAGER),
         ],
         stage_deadline=deadline,
     )
-    room.night_actions["u1"] = NightAction(
-        actor_id="u1", action="恋人", target_id="u2", day=3, second_target_id="u3"
+    room.night_actions["10001"] = NightAction(
+        actor_id="10001", action="恋人", target_id="10002", day=3, second_target_id="10003"
     )
     room.statistics["pending_actions"] = {
-        "u1": {"action": "cupid", "targets": ["2"], "required": 2, "phase": "night", "day": 3}
+        "10001": {"action": "cupid", "targets": ["2"], "required": 2, "phase": "night", "day": 3}
     }
 
     restored = GameRoom.from_snapshot(room.snapshot())
 
     assert restored.stage_deadline == deadline
-    assert restored.night_actions["u1"].second_target_id == "u3"
+    assert restored.night_actions["10001"].second_target_id == "10003"
     assert restored.statistics["pending_actions"] == room.statistics["pending_actions"]
 
 
@@ -190,9 +215,9 @@ def test_service_restart_processes_overdue_room_and_skips_finished_room() -> Non
         session_id="restart-lobby",
         rules=ruleset_official(),
         phase=GamePhase.LOBBY,
-        host_user_id="u1",
+        host_user_id="10001",
         stage_deadline=datetime.now(timezone.utc) - timedelta(seconds=1),
-        players=[Player(f"u{seat}", f"玩家{seat}", seat) for seat in range(1, 6)],
+        players=[Player(f"1000{seat}", f"玩家{seat}", seat) for seat in range(1, 6)],
     )
     finished = GameRoom(
         session_id="finished-room",
@@ -201,8 +226,6 @@ def test_service_restart_processes_overdue_room_and_skips_finished_room() -> Non
         stage_deadline=None,
     )
     store = InMemoryRoomStore([overdue, finished])
-
-    import asyncio
 
     processed = asyncio.run(GameApplication(store).process_due_rooms())
     restored = asyncio.run(store.get_room("restart-lobby"))
@@ -219,9 +242,9 @@ def test_engine_abandon_overdue_uses_timeout_notice() -> None:
         rules=ruleset_official(),
         phase=GamePhase.NIGHT,
         day=1,
-        host_user_id="u1",
+        host_user_id="10001",
         stage_deadline=datetime.now(timezone.utc) - timedelta(seconds=STALE_TIMEOUT_SECONDS + 10),
-        players=[Player("u1", "甲", 1), Player("u2", "乙", 2)],
+        players=[Player("10001", "甲", 1), Player("10002", "乙", 2)],
     )
     events = GameRoomEngine().abandon_overdue(room)
     assert room.phase == GamePhase.CANCELLED
@@ -235,9 +258,12 @@ def test_stale_overdue_room_is_abandoned_instead_of_advancing() -> None:
         rules=ruleset_official(),
         phase=GamePhase.NIGHT,
         day=1,
-        host_user_id="u1",
+        host_user_id="10001",
         stage_deadline=datetime.now(timezone.utc) - timedelta(seconds=STALE_TIMEOUT_SECONDS + 5),
-        players=[Player("u1", "甲", 1, role=Role.VILLAGER), Player("u2", "乙", 2, role=Role.WOLF)],
+        players=[
+            Player("10001", "甲", 1, role=Role.VILLAGER),
+            Player("10002", "乙", 2, role=Role.WOLF),
+        ],
     )
     store = InMemoryRoomStore([overdue])
 
@@ -258,8 +284,6 @@ def test_group_rule_config_survives_new_store_instance() -> None:
     first_store = PostgreSQLStore("postgresql://test")
     first_store._pool = pool  # type: ignore[assignment]
 
-    import asyncio
-
     asyncio.run(first_store.save_group_rule_config("group-a", {"vote_seconds": 45}, "admin"))
 
     restarted_store = PostgreSQLStore("postgresql://test")
@@ -271,16 +295,16 @@ def test_group_rule_config_survives_new_store_instance() -> None:
 def test_private_day_ability_requires_explicit_confirmation() -> None:
     app = GameApplication(object())
     room = GameRoom(
-        session_id="group-1",
+        session_id="20001",
         rules=ruleset_official(),
         phase=GamePhase.DAY,
         day=2,
-        players=[Player("u1", "市长", 1, role=Role.MAYOR)],
+        players=[Player("10001", "市长", 1, role=Role.MAYOR)],
     )
     event = PlatformEvent(
         event_id="step-day-1",
-        session=PlatformSession(SessionType.C2C, "u1"),
-        user_id="u1",
+        session=PlatformSession(SessionType.C2C, "10001"),
+        user_id="10001",
         display_name="市长",
         text="/mayor",
     )
@@ -291,16 +315,16 @@ def test_private_day_ability_requires_explicit_confirmation() -> None:
 def test_private_mayor_reveal_can_begin_during_vote() -> None:
     app = GameApplication(object())
     room = GameRoom(
-        session_id="group-1",
+        session_id="20001",
         rules=ruleset_official(),
         phase=GamePhase.VOTE,
         day=1,
-        players=[Player("u1", "市长", 1, role=Role.MAYOR)],
+        players=[Player("10001", "市长", 1, role=Role.MAYOR)],
     )
     event = PlatformEvent(
         event_id="step-mayor-vote-1",
-        session=PlatformSession(SessionType.C2C, "u1"),
-        user_id="u1",
+        session=PlatformSession(SessionType.C2C, "10001"),
+        user_id="10001",
         display_name="市长",
         text="/mayor",
     )
@@ -309,170 +333,343 @@ def test_private_mayor_reveal_can_begin_during_vote() -> None:
     assert "发送“确认”使用" in prompt[0].text
 
 
-def test_normalize_group_and_c2c() -> None:
-    group = normalize_group_message({
-        "id": "e1",
-        "group_openid": "g1",
-        "content": "加入",
-        "timestamp": "2026-01-01T00:00:00+00:00",
-        "author": {"member_openid": "u1", "username": "甲"},
+# ---------------- NapCat 事件归一化 ----------------
+
+
+def test_normalize_group_message_uses_real_qq_numbers() -> None:
+    event = normalize_group_message(_group_payload("加入"))
+    assert event.session.session_type == SessionType.GROUP
+    assert event.session.session_id == "20001"
+    assert event.user_id == "10001"
+    assert event.text == "加入"
+    assert event.reply_message_id == "1001"
+    assert event.group_role == "member"
+    # 展示名取 QQ 昵称而不是群名片：名片开局后会被改成「N号」。
+    assert event.display_name == "沉潜"
+
+
+def test_normalize_group_message_drops_at_segments() -> None:
+    payload = _group_payload(
+        "/join",
+        message=[
+            {"type": "at", "data": {"qq": "10000"}},
+            {"type": "text", "data": {"text": " /join "}},
+        ],
+        raw_message="[CQ:at,qq=10000] /join",
+    )
+    assert normalize_group_message(payload).text == "/join"
+    # string 格式的消息体走 CQ 码兜底，结果必须一致。
+    assert message_text({"message": "[CQ:at,qq=10000] /join"}) == "/join"
+
+
+def test_normalize_private_message_session_is_the_qq_number() -> None:
+    event = normalize_private_message({
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 2002,
+        "user_id": 10001,
+        "time": 1767225600,
+        "raw_message": "查验 1",
+        "message": [{"type": "text", "data": {"text": "查验 1"}}],
+        "sender": {"user_id": 10001, "nickname": "沉潜"},
     })
-    assert group.session.session_type == SessionType.GROUP
-    assert group.user_id == "u1"
-    c2c = normalize_c2c_message({
-        "id": "e2",
-        "content": "查验 1",
-        "author": {"user_openid": "u1", "username": "甲"},
-    })
-    assert c2c.session.session_type == SessionType.C2C
-    channel = normalize_channel_message({
-        "id": "e3",
-        "channel_id": "c1",
-        "content": "状态",
-        "author": {"id": "u1", "username": "甲"},
-    })
-    assert channel.session.session_type == SessionType.CHANNEL
+    assert event.session.session_type == SessionType.C2C
+    assert event.session.session_id == "10001"
+    assert event.user_id == "10001"
+    assert event.text == "查验 1"
 
 
-def test_normalize_official_direct_message() -> None:
-    direct = normalize_direct_message({
-        "id": "dm-message-1",
-        "event_id": "dm-event-1",
-        "guild_id": "dm-session-1",
-        "content": "/身份",
-        "timestamp": "2026-01-01T00:00:00+00:00",
-        "author": {"id": "u1", "username": "甲", "bot": False},
-    })
-    assert direct.session.session_type == SessionType.DIRECT
-    assert direct.session.session_id == "dm-session-1"
-    assert direct.user_id == "u1"
-    assert direct.event_id == "dm-event-1"
-    assert direct.reply_message_id == "dm-message-1"
-    assert direct.text == "/身份"
+def test_normalize_rejects_events_without_identifiers() -> None:
+    with pytest.raises(ValueError):
+        normalize_group_message({"message_id": 1, "user_id": 10001})
+    with pytest.raises(ValueError):
+        normalize_private_message({"user_id": 10001})
 
 
-def test_direct_delivery_uses_official_post_dms() -> None:
-    class FakeApi:
-        def __init__(self):
-            self.calls = []
+# ---------------- NapCat 投递与群管理能力 ----------------
 
-        async def post_dms(self, **kwargs):
-            self.calls.append(kwargs)
 
-    class FakeClient:
-        def __init__(self, api):
-            self.api = api
+def _napcat_adapter(result: object = None):
+    adapter = NapCatAdapter("ws://127.0.0.1:3001", "", object())
+    adapter.min_send_interval = 0.0
+    calls: list[tuple[str, dict]] = []
 
-    api = FakeApi()
-    adapter = QQBotAdapter("12345", "secret-16-chars", object())
-    adapter._client = FakeClient(api)
-    record = DeliveryRecord(
+    async def fake_call(action: str, **params):
+        calls.append((action, params))
+        return result
+
+    adapter.call = fake_call  # type: ignore[assignment]
+    return adapter, calls
+
+
+def _record(**overrides) -> DeliveryRecord:
+    data = dict(
         delivery_id="delivery-1",
-        target_type=SessionType.DIRECT,
-        target_id="dm-session-1",
-        text="你的身份是【预言家】。",
-        room_id="group-1",
-        reply_to="dm-message-1",
-        source_event_id="dm-event-1",
-        event_id="dm-event-1",
+        target_type=SessionType.GROUP,
+        target_id="20001",
+        text="天黑请闭眼。",
+        room_id="20001",
+        reply_to=None,
+        source_event_id="napcat:1001",
+        event_id=None,
         state_version=1,
         status="pending",
         attempts=0,
         last_error=None,
         next_attempt_at=None,
     )
+    data.update(overrides)
+    return DeliveryRecord(**data)
 
-    import asyncio
 
+def test_group_delivery_calls_send_group_msg() -> None:
+    adapter, calls = _napcat_adapter()
+    asyncio.run(adapter.send_delivery(_record()))
+    assert calls == [("send_group_msg", {"group_id": 20001, "message": "天黑请闭眼。"})]
+
+
+def test_private_delivery_calls_send_private_msg() -> None:
+    adapter, calls = _napcat_adapter()
+    record = _record(
+        delivery_id="delivery-2",
+        target_type=SessionType.C2C,
+        target_id="10001",
+        text="你的身份：预言家",
+    )
     asyncio.run(adapter.send_delivery(record))
-    assert api.calls == [{
-        "guild_id": "dm-session-1",
-        "content": "你的身份是【预言家】。",
-        "msg_id": "dm-message-1",
-        "event_id": "dm-event-1",
-    }]
+    assert calls == [("send_private_msg", {"user_id": 10001, "message": "你的身份：预言家"})]
 
 
-def test_creates_official_group_command_panel_once() -> None:
-    class FakeRoute:
-        def __init__(self, method, path):
-            self.method = method
-            self.path = path
+def test_delivery_to_non_numeric_target_is_permanently_dead() -> None:
+    """官方 openid 时代遗留的队列数据在 NapCat 下永远发不出去，直接判死。"""
+    adapter, calls = _napcat_adapter()
+    with pytest.raises(PermanentSendError):
+        asyncio.run(adapter.send_delivery(_record(target_id="USEROPENID1")))
+    assert calls == []
 
-    class FakeHttp:
+
+def test_is_group_admin_reads_role_and_caches() -> None:
+    adapter, calls = _napcat_adapter({"role": "admin"})
+    adapter.self_id = "10000"
+    assert asyncio.run(adapter.is_group_admin("20001")) is True
+    assert asyncio.run(adapter.is_group_admin("20001")) is True
+    assert len(calls) == 1
+    assert calls[0][0] == "get_group_member_info"
+
+
+def test_is_group_admin_false_for_plain_member() -> None:
+    adapter, _calls = _napcat_adapter({"role": "member"})
+    adapter.self_id = "10000"
+    assert asyncio.run(adapter.is_group_admin("20001")) is False
+
+
+def test_set_group_card_failure_is_swallowed() -> None:
+    adapter = NapCatAdapter("ws://127.0.0.1:3001", "", object())
+
+    async def boom(_action: str, **_params):
+        raise RuntimeError("权限不足")
+
+    adapter.call = boom  # type: ignore[assignment]
+    assert asyncio.run(adapter.set_group_card("20001", "10001", "1号")) is False
+
+
+def test_group_member_names_prefer_nickname_over_card() -> None:
+    members = [
+        {"user_id": 10001, "nickname": "沉潜", "card": "1号"},
+        {"user_id": 10002, "nickname": "", "card": "2号"},
+    ]
+    adapter, _calls = _napcat_adapter(members)
+    assert asyncio.run(adapter.get_group_member_names("20001")) == {
+        "10001": "沉潜",
+        "10002": "2号",
+    }
+
+
+# ---------------- 应用层：私聊路由、名片同步、死者拦截 ----------------
+
+
+def test_private_message_targets_the_players_qq_number() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    source = normalize_group_message(_group_payload("/go"))
+    message = asyncio.run(app._private_message("10002", "你的身份：预言家", source))
+    assert message.target.session_type == SessionType.C2C
+    assert message.target.session_id == "10002"
+    assert message.reply_to is None
+    assert message.event_id is None
+
+
+def test_private_message_quotes_the_players_own_private_message() -> None:
+    app = GameApplication(InMemoryRoomStore([]))
+    source = normalize_private_message({
+        "message_id": 2002,
+        "user_id": 10002,
+        "raw_message": "/seer",
+        "sender": {"user_id": 10002, "nickname": "乙"},
+    })
+    message = asyncio.run(app._private_message("10002", "查验结果：好人", source))
+    assert message.target.session_id == "10002"
+    assert message.reply_to == "2002"
+
+
+def test_identity_delivery_needs_no_binding_hint() -> None:
+    room = GameRoom(
+        session_id="20001",
+        rules=ruleset_official(),
+        phase=GamePhase.NIGHT,
+        day=1,
+        players=[
+            Player("10001", "甲", 1, role=Role.SEER),
+            Player("10002", "乙", 2, role=Role.WOLF),
+        ],
+    )
+    app = GameApplication(InMemoryRoomStore([room]))
+    source = normalize_group_message(_group_payload("/go"))
+    events = [
+        DomainEvent("game_started", "游戏开始。", public=True),
+        DomainEvent("identity", "你的身份：预言家", public=False, target_user_id="10001"),
+    ]
+    messages = asyncio.run(app._events_to_messages(events, room, source))
+    private = [item for item in messages if item.target.session_type == SessionType.C2C]
+    public = [item for item in messages if item.target.session_type == SessionType.GROUP]
+    assert [item.target.session_id for item in private] == ["10001"]
+    # 不再有「无好友关系」「先私聊 /link」这类绑定引导。
+    assert not any("好友" in item.text or "绑定" in item.text for item in public)
+
+
+def test_sync_cards_numbers_the_living_and_marks_the_dead() -> None:
+    room = GameRoom(
+        session_id="20001",
+        rules=ruleset_official(),
+        phase=GamePhase.DAY,
+        day=1,
+        players=[
+            Player("10001", "沉潜", 1, role=Role.SEER),
+            Player("10002", "乙", 2, role=Role.WOLF, alive=False),
+        ],
+    )
+    app = GameApplication(InMemoryRoomStore([room]))
+    platform = FakePlatform()
+    app.bind_platform(platform)
+
+    asyncio.run(app._sync_cards(room))
+    assert platform.cards == [
+        ("20001", "10001", "1号"),
+        ("20001", "10002", "2号（已出局）"),
+    ]
+
+    # 幂等：状态没变就不再重复发请求。
+    asyncio.run(app._sync_cards(room))
+    assert len(platform.cards) == 2
+
+    # 终局清空名片，把展示权还给玩家。
+    room.phase = GamePhase.FINISHED
+    asyncio.run(app._sync_cards(room))
+    assert platform.cards[-2:] == [("20001", "10001", ""), ("20001", "10002", "")]
+
+
+def test_sync_cards_skipped_when_bot_is_not_group_admin() -> None:
+    room = GameRoom(
+        session_id="20001",
+        rules=ruleset_official(),
+        phase=GamePhase.DAY,
+        day=1,
+        players=[Player("10001", "沉潜", 1, role=Role.SEER)],
+    )
+    app = GameApplication(InMemoryRoomStore([room]))
+    platform = FakePlatform(admin=False)
+    app.bind_platform(platform)
+    asyncio.run(app._sync_cards(room))
+    assert platform.cards == []
+
+
+def test_dead_player_actions_are_rejected_but_queries_still_work() -> None:
+    room = GameRoom(
+        session_id="20001",
+        rules=ruleset_official(),
+        phase=GamePhase.NIGHT,
+        day=1,
+        players=[
+            Player("10001", "甲", 1, role=Role.SEER),
+            Player("10002", "乙", 2, role=Role.WOLF, alive=False),
+        ],
+    )
+    event = normalize_group_message(_group_payload("查验 1", user="10002"))
+    with pytest.raises(GameRuleError, match="已经出局"):
+        GameApplication._reject_if_dead(room, event, parse_command("查验 1"))
+    # 查询类指令照常放行。
+    GameApplication._reject_if_dead(room, event, parse_command("/status"))
+    # 活着的玩家不受影响。
+    alive_event = normalize_group_message(_group_payload("查验 2", user="10001"))
+    GameApplication._reject_if_dead(room, alive_event, parse_command("查验 2"))
+
+
+def test_process_deliveries_marks_permanent_failure_as_dead() -> None:
+    record = _record(target_id="USEROPENID1")
+
+    class Store:
         def __init__(self):
-            self.calls = []
+            self.dead = None
 
-        async def request(self, route, **kwargs):
-            self.calls.append((route.method, route.path, kwargs))
-            if route.method == "GET":
-                return {"records": []}
-            return {"panel_id": "panel-1"}
+        async def pending_deliveries(self, *_args, **_kwargs):
+            return [record]
 
-    class FakeClient:
-        def __init__(self):
-            self.api = type("Api", (), {"_http": FakeHttp()})()
+        async def claim_delivery(self, _delivery_id):
+            return record
 
-    adapter = QQBotAdapter("12345", "secret-16-chars", object())
-    adapter._client = FakeClient()
-    adapter._route_factory = FakeRoute
-    import asyncio
+        async def mark_delivery_dead(self, delivery_id, error):
+            self.dead = (delivery_id, error)
 
-    asyncio.run(adapter.ensure_group_command_panel())
-    calls = adapter.client.api._http.calls
-    assert calls[0][0:2] == ("GET", "/v2/panels?scope=group&limit=50")
-    assert calls[1][0:2] == ("POST", "/v2/panels")
-    assert calls[1][2]["json"]["scope"] == "group"
-    assert calls[1][2]["json"]["panel"]["items"][0]["name"] == "/startgame"
-    items = calls[1][2]["json"]["panel"]["items"]
-    names = [item["name"] for item in items]
-    for required in ("/link", "/bindqq", "/flee", "/extend"):
-        assert required in names
-    assert "/players" not in names
-    assert len(items) <= 20
-    for item in items:
-        assert item["type"] == "command"
-        assert item["only_admin"] is False
-        assert item["desc"].strip()
-        assert any("\u4e00" <= ch <= "\u9fff" for ch in item["desc"])
+        async def mark_delivery_failure(self, *_args, **_kwargs):
+            raise AssertionError("永久失败不应该走重试路径")
+
+        async def purge_finished_deliveries(self, *_args, **_kwargs):
+            return 0
+
+    class Sender:
+        async def send_delivery(self, _record):
+            raise PermanentSendError("目标标识不是 QQ 号：USEROPENID1")
+
+    store = Store()
+    processed = asyncio.run(GameApplication(store).process_deliveries(Sender(), 5))
+    assert processed == 1
+    assert store.dead is not None and store.dead[0] == record.delivery_id
 
 
-def test_settings_reject_sqlite_and_missing_secrets(monkeypatch) -> None:
-    monkeypatch.delenv("APP_ID", raising=False)
-    monkeypatch.delenv("APP_SECRET", raising=False)
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    try:
+# ---------------- 配置 ----------------
+
+
+def _clear_napcat_env(monkeypatch) -> None:
+    for name in ("NAPCAT_WS_URL", "NAPCAT_ACCESS_TOKEN", "DATABASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_settings_reject_missing_endpoint_and_sqlite(monkeypatch) -> None:
+    _clear_napcat_env(monkeypatch)
+    with pytest.raises(ValueError):
         Settings.from_env()
-        raised = False
-    except ValueError:
-        raised = True
-    assert raised
-    monkeypatch.setenv("APP_ID", "12345")
-    monkeypatch.setenv("APP_SECRET", "x" * 16)
+    monkeypatch.setenv("NAPCAT_WS_URL", "http://127.0.0.1:3001")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://werewolf:werewolf@127.0.0.1:5432/werewolf")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("DATABASE_URL", "sqlite:///tmp.db")
-    try:
+    with pytest.raises(ValueError):
         Settings.from_env()
-        raised = False
-    except ValueError:
-        raised = True
-    assert raised
 
 
-def test_settings_accept_postgres(monkeypatch) -> None:
-    monkeypatch.setenv("APP_ID", "12345")
-    monkeypatch.setenv("APP_SECRET", "official-secret-16")
+def test_settings_accept_napcat_websocket_and_postgres(monkeypatch) -> None:
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001?access_token=secret-token")
+    monkeypatch.setenv("NAPCAT_ACCESS_TOKEN", "secret-token")
     monkeypatch.setenv("DATABASE_URL", "postgresql://werewolf:werewolf@127.0.0.1:5432/werewolf")
     settings = Settings.from_env()
-    assert settings.app_id_masked != settings.app_id
-    assert "official-secret" not in settings.app_id_masked
+    assert settings.napcat_ws_url.startswith("ws://")
     assert settings.database_url.startswith("postgresql://")
-    now = datetime.now(timezone.utc)
-    assert now.tzinfo is not None
+    # 日志端点不能泄露 token。
+    assert "secret-token" not in settings.napcat_endpoint_masked
 
 
 def test_settings_passes_group_rule_switches_to_new_rooms(monkeypatch) -> None:
-    monkeypatch.setenv("APP_ID", "12345")
-    monkeypatch.setenv("APP_SECRET", "official-secret-16")
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("DATABASE_URL", "postgresql://werewolf:werewolf@127.0.0.1:5432/werewolf")
     monkeypatch.setenv("RANDOM_LYNCH", "true")
     monkeypatch.setenv("SECRET_LYNCH", "true")
@@ -488,209 +685,10 @@ def test_settings_passes_group_rule_switches_to_new_rooms(monkeypatch) -> None:
 
 
 def test_settings_passes_role_visibility_to_new_rooms(monkeypatch) -> None:
-    monkeypatch.setenv("APP_ID", "12345")
-    monkeypatch.setenv("APP_SECRET", "official-secret-16")
+    monkeypatch.setenv("NAPCAT_WS_URL", "ws://127.0.0.1:3001")
     monkeypatch.setenv("DATABASE_URL", "postgresql://werewolf:werewolf@127.0.0.1:5432/werewolf")
     monkeypatch.setenv("SHOW_ROLES_ON_DEATH", "false")
     monkeypatch.setenv("SHOW_ROLES_END", "All")
     rules = Settings.from_env().rules
     assert rules.show_roles_on_death is False
     assert rules.show_roles_end == "All"
-
-
-def _c2c_record(**overrides):
-    data = dict(
-        delivery_id="delivery-c2c-1",
-        target_type=SessionType.C2C,
-        target_id="USEROPENID1",
-        text="你的身份是【预言家】。",
-        room_id="group-1",
-        reply_to=None,
-        source_event_id="group-event-1",
-        event_id=None,
-        state_version=1,
-        status="pending",
-        attempts=0,
-        last_error=None,
-        next_attempt_at=None,
-    )
-    data.update(overrides)
-    return DeliveryRecord(**data)
-
-
-def _http_adapter(request_impl):
-    class FakeRoute:
-        def __init__(self, method, path, **parameters):
-            self.method = method
-            self.path = path
-            self.parameters = parameters
-
-    class FakeHttp:
-        def __init__(self):
-            self.calls = []
-
-        async def request(self, route, **kwargs):
-            self.calls.append((route.method, route.path, route.parameters, kwargs))
-            return await request_impl(route, **kwargs)
-
-    class FakeClient:
-        def __init__(self):
-            self.api = type("Api", (), {"_http": FakeHttp()})()
-
-    adapter = QQBotAdapter("12345", "secret-16-chars", object())
-    adapter._client = FakeClient()
-    adapter._route_factory = FakeRoute
-    return adapter
-
-
-def test_c2c_active_payload_omits_null_msg_id() -> None:
-    async def ok(_route, **_kwargs):
-        return {}
-
-    adapter = _http_adapter(ok)
-    asyncio.run(adapter.send_delivery(_c2c_record()))
-    method, path, params, kwargs = adapter.client.api._http.calls[0]
-    assert method == "POST"
-    assert path == "/v2/users/{openid}/messages"
-    assert params["openid"] == "USEROPENID1"
-    payload = kwargs["json"]
-    assert payload["content"].startswith("你的身份是")
-    assert "msg_id" not in payload
-    assert "msg_seq" not in payload
-    assert "event_id" not in payload
-
-
-def test_c2c_passive_payload_keeps_msg_id_and_seq() -> None:
-    async def ok(_route, **_kwargs):
-        return {}
-
-    adapter = _http_adapter(ok)
-    asyncio.run(
-        adapter.send_delivery(_c2c_record(reply_to="c2c-msg-1", event_id="c2c-evt-1", msg_seq=2))
-    )
-    payload = adapter.client.api._http.calls[0][3]["json"]
-    assert payload["msg_id"] == "c2c-msg-1"
-    assert payload["event_id"] == "c2c-evt-1"
-    assert payload["msg_seq"] == 2
-
-
-def test_c2c_no_friend_raises_needs_anchor() -> None:
-    async def boom(_route, **_kwargs):
-        raise RuntimeError("消息发送失败, 无好友关系")
-
-    adapter = _http_adapter(boom)
-    with pytest.raises(NeedsAnchorSendError, match="无好友关系"):
-        asyncio.run(adapter.send_delivery(_c2c_record()))
-
-
-def test_private_message_from_group_does_not_reuse_group_msg_id() -> None:
-    app = GameApplication(InMemoryRoomStore([]))
-    source = normalize_group_message({
-        "id": "group-msg-1",
-        "event_id": "group-evt-1",
-        "group_openid": "g1",
-        "content": "/go",
-        "timestamp": "2026-09-02T00:00:00+00:00",
-        "author": {"member_openid": "u1", "username": "甲"},
-    })
-    message = asyncio.run(app._private_message("u2", "你的身份是【预言家】。", source))
-    assert message.target.session_type == SessionType.C2C
-    assert message.target.session_id == "u2"
-    assert message.reply_to is None
-    assert message.event_id is None
-
-
-def test_private_message_reuses_recent_c2c_anchor() -> None:
-    class Store(InMemoryRoomStore):
-        async def get_user_reply_anchor(self, user_id):
-            return {
-                "session_type": "c2c",
-                "session_id": user_id,
-                "msg_id": "c2c-msg-9",
-                "event_id": "c2c-evt-9",
-                "uses": 0,
-                "updated_at": datetime.now(timezone.utc),
-            }
-
-        async def note_user_reply_anchor_use(self, _user_id):
-            self.noted = True
-
-    store = Store([])
-    app = GameApplication(store)
-    source = normalize_group_message({
-        "id": "group-msg-1",
-        "event_id": "group-evt-1",
-        "group_openid": "g1",
-        "content": "/go",
-        "timestamp": "2026-09-02T00:00:00+00:00",
-        "author": {"member_openid": "u1", "username": "甲"},
-    })
-    message = asyncio.run(app._private_message("u2", "你的身份是【预言家】。", source))
-    assert message.target.session_type == SessionType.C2C
-    assert message.reply_to == "c2c-msg-9"
-    assert message.event_id == "c2c-evt-9"
-    assert store.noted is True
-
-
-def test_start_from_group_hints_when_private_anchor_missing() -> None:
-    room = GameRoom(
-        session_id="g1",
-        rules=ruleset_official(),
-        phase=GamePhase.NIGHT,
-        day=1,
-        players=[
-            Player("u1", "甲", 1, role=Role.SEER),
-            Player("u2", "乙", 2, role=Role.WOLF),
-        ],
-    )
-    app = GameApplication(InMemoryRoomStore([room]))
-    source = normalize_group_message({
-        "id": "group-msg-1",
-        "event_id": "group-evt-1",
-        "group_openid": "g1",
-        "content": "/go",
-        "timestamp": "2026-09-02T00:00:00+00:00",
-        "author": {"member_openid": "u1", "username": "甲"},
-    })
-    events = [
-        DomainEvent("game_started", "游戏开始。", public=True),
-        DomainEvent("identity", "你的身份是【预言家】。", public=False, target_user_id="u1"),
-    ]
-    messages = asyncio.run(app._events_to_messages(events, room, source))
-    private = [item for item in messages if item.target.session_type == SessionType.C2C]
-    public = [item for item in messages if item.target.session_type == SessionType.GROUP]
-    assert private and all(item.reply_to is None for item in private)
-    assert any("无好友关系" in item.text for item in public)
-
-
-def test_process_deliveries_parks_no_friend_as_waiting() -> None:
-    record = _c2c_record()
-
-    class Store:
-        def __init__(self):
-            self.parked = None
-
-        async def pending_deliveries(self, *args, **kwargs):
-            return [record]
-
-        async def claim_delivery(self, _delivery_id):
-            return record
-
-        async def park_delivery_waiting(self, delivery_id, error):
-            self.parked = (delivery_id, error)
-
-        async def expire_waiting_deliveries(self, *_args, **_kwargs):
-            return 0
-
-        async def purge_finished_deliveries(self, *_args, **_kwargs):
-            return 0
-
-    class Sender:
-        async def send_delivery(self, _record):
-            raise NeedsAnchorSendError("消息发送失败, 无好友关系")
-
-    store = Store()
-    processed = asyncio.run(GameApplication(store).process_deliveries(Sender(), 5))
-    assert processed == 1
-    assert store.parked[0] == record.delivery_id
-    assert "无好友关系" in store.parked[1]

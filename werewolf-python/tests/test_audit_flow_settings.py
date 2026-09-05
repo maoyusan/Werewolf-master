@@ -118,9 +118,6 @@ class _FakeStore:
         self.saved_config = dict(values)
         self.group_config = dict(values)
 
-    async def get_direct_session(self, _user_id: str):
-        return None
-
 
 def _group_event(event_id: str, text: str, user_id: str = "creator") -> PlatformEvent:
     return PlatformEvent(

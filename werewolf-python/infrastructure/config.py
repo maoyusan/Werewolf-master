@@ -30,8 +30,10 @@ def _bool_env(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    app_id: str
-    app_secret: str
+    # NapCat（OneBot 11）正向 WebSocket 地址，例如 ws://127.0.0.1:3001。
+    napcat_ws_url: str
+    # NapCat 里配置的 access_token，留空表示未开鉴权。
+    napcat_access_token: str
     database_url: str
     host: str
     port: int
@@ -73,8 +75,8 @@ class Settings:
         except ValueError as exc:
             raise ValueError("配置项 GAME_MODE 必须为 Normal 或 Chaos") from exc
         values = cls(
-            app_id=os.getenv("APP_ID", "").strip(),
-            app_secret=os.getenv("APP_SECRET", "").strip(),
+            napcat_ws_url=os.getenv("NAPCAT_WS_URL", "").strip(),
+            napcat_access_token=os.getenv("NAPCAT_ACCESS_TOKEN", "").strip(),
             database_url=os.getenv("DATABASE_URL", "").strip(),
             host=os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=_int_env("PORT", 18100),
@@ -83,8 +85,9 @@ class Settings:
             required_roles=_roles_env("REQUIRED_ROLES"),
             admin_user_ids=_roles_env("ADMIN_USER_IDS"),
             # 官方把命令分为 GroupAdminOnly / GlobalAdminOnly / DevOnly 三档
-            # （Attributes/CommandAttribute.cs）。QQ 版没有 Telegram 的群管理员接口，
-            # 群管理员用 ADMIN_USER_IDS，全局管理员/开发者合并为 DEV_USER_IDS。
+            # （Attributes/CommandAttribute.cs）。NapCat 能读到群角色，群管理员命令
+            # 优先按群内 owner/admin 放行，ADMIN_USER_IDS 作为额外白名单；
+            # 全局管理员/开发者合并为 DEV_USER_IDS。
             dev_user_ids=_roles_env("DEV_USER_IDS"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             min_players=_int_env("MIN_PLAYERS", 5),
@@ -115,14 +118,12 @@ class Settings:
         return values
 
     def validate(self, *, require_credentials: bool = True, require_database: bool = True) -> None:
-        if require_credentials and (not self.app_id or not self.app_secret):
-            raise ValueError("配置项 APP_ID 和 APP_SECRET 必须同时设置")
+        if require_credentials and not self.napcat_ws_url:
+            raise ValueError("配置项 NAPCAT_WS_URL 必须设置")
         if require_database and not self.database_url:
             raise ValueError("配置项 DATABASE_URL 必须设置")
-        if self.app_id and (not self.app_id.isdigit() or len(self.app_id) < 3):
-            raise ValueError("配置项 APP_ID 格式无效")
-        if self.app_secret and len(self.app_secret) < 16:
-            raise ValueError("配置项 APP_SECRET 格式无效")
+        if self.napcat_ws_url and not self.napcat_ws_url.startswith(("ws://", "wss://")):
+            raise ValueError("配置项 NAPCAT_WS_URL 必须是 ws:// 或 wss:// 地址")
         if self.database_url and not self.database_url.startswith(("postgresql://", "postgres://")):
             raise ValueError("配置项 DATABASE_URL 必须是 PostgreSQL 连接串")
         if not 1 <= self.port <= 65535:
@@ -159,10 +160,9 @@ class Settings:
             Role(value)
 
     @property
-    def app_id_masked(self) -> str:
-        if len(self.app_id) <= 4:
-            return "***"
-        return f"{self.app_id[:2]}***{self.app_id[-2:]}"
+    def napcat_endpoint_masked(self) -> str:
+        """日志里展示的 NapCat 端点：只留主机与端口，不带 token。"""
+        return self.napcat_ws_url.split("?", 1)[0] or "（未配置）"
 
     @property
     def rules(self):

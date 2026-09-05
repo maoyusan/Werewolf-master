@@ -1,12 +1,14 @@
 # QQ 文字指令入口复刻审计分片
 
+> 复查说明（2026-09-05）：本文下方部分差异表保留了历史审计记录，`xfail` 及旧的测试数量不代表当前代码状态。当前工作区已移除这些 `xfail` 标记；请以 `python -m pytest -q` 的实时结果和 `docs/official-parity-checklist.md` 为准。
+
 独立复刻审计（openspec 变更 independent-official-parity-audit 任务 8.1–8.5）。
 官方期望值唯一来源：`work/upstream-official/Werewolf for Telegram`，提交 `ca547ccb0ed01e6f282f9e8e71f7a24d547b24d7`。
 
 - Python 源码根目录：`D:\Project\ScriptProjects\Werewolf-master\werewolf-python`
 - 检查日期：`2026-09-01`
-- 测试文件：`tests/test_audit_qq_commands.py`（48 个通过 + 8 个 strict xfail）
-- 基线：全量 `python -m pytest -q` → 286 passed + 8 xfailed（strict），无失败无跳过。
+- 测试文件：`tests/test_audit_qq_commands.py`（当前收集 62 项，均通过）
+- 基线：全量 `python -m pytest` → `621 passed`；历史 `286 passed + 8 xfailed` 统计已失效。
 
 状态：已通过 / 已差异 / 已确认未调用 / 未决。
 每条记录均有可重跑固定输入与实测结果（`-k <测试名>` 即重跑）。
@@ -23,7 +25,7 @@
 | Q-006 | GameCommands.cs:44-74 | `/join` 群命令 | 无局 | NoGame：无局提示 | service.py:214-216 | test_join_without_room_guides_startgame | `/join`（群 u1） | 输出含 /startgame 引导 | 已通过 | - | 2026-09-01 |
 | Q-007 | Werewolf.cs:685-824 | AddPlayer（join） | 群在入场期且玩家未加入 | 加入并展示 YouJoined | service.py:219-221 / engine.py:153-181 | test_join_success_then_repeat_join_is_silent | 建局后 `/join`（u2 “甲”） | “甲 加入游戏”，玩家入座 | 已通过 | - | 2026-09-01 |
 | Q-008 | Werewolf.cs:695-699 | AddPlayer | 玩家已加入 | 静默忽略（不报错） | engine.py:156-157 | test_join_success_then_repeat_join_is_silent | 同一玩家再次 `/join` | 返回空消息，无重复入座 | 已通过 | - | 2026-09-01 |
-| Q-009 | GameCommands.cs:44-74 + UpdateHandler.cs:428-432 | `/join` 带 @提及/空格 | 群命令 | Command 解析去除 @ 与多余空格后命中同一流程 | application/commands.py:150-151 | test_join_with_bot_mention_and_extra_spaces_still_joins | `<@!bot-openid-1>   /join   `（群 u2） | “乙 加入游戏” | 已通过 | - | 2026-09-01 |
+| Q-009 | GameCommands.cs:44-74 + UpdateHandler.cs:428-432 | `/join` 带 @提及/空格 | 群命令 | Command 解析去除 @ 与多余空格后命中同一流程 | application/commands.py:150-151 | test_join_with_bot_mention_and_extra_spaces_still_joins | `[CQ:at,qq=10000]   /join   `（群 u2） | “乙 加入游戏” | 已通过 | - | 2026-09-01 |
 | Q-010 | Werewolf.cs:689-693 | AddPlayer | 对局已开始（!IsJoining） | 静默忽略 | engine.py:154-155 | test_join_during_running_game_is_silent | 夜晚对局中 `/join`（u9） | 返回空消息，未入座 | 已通过 | - | 2026-09-01 |
 | Q-011 | GameCommands.cs:50-55 | `/join` 私聊 | 私聊 | JoinFromGroup：请在群里加入 | service.py:218-219 | test_join_in_private_rejected | `/join`（C2C u1） | “该命令请在群里发送” | 已通过 | - | 2026-09-01 |
 | Q-012 | Werewolf.cs:731-735 | AddPlayer | 人数已满 | PlayerLimitReached：拒绝 | engine.py:163-164 | test_join_when_room_full_rejected | 5 人满房 `/join`（u9） | “房间人数已满” | 已通过 | - | 2026-09-01 |
@@ -48,13 +50,13 @@
 | Q-031 | Werewolf.cs:2524-2534 | ExtendTime | 管理员但不在局 | p==null 静默无效，不改变等待时间 | engine.py:237-238 | test_extend_by_admin_not_seated_is_noop | allow_extend=False `/extend 30`（admin 不在局） | 等待时间被延长 | 已差异 | Q-DIFF-04 | 2026-09-01 |
 | Q-032 | GeneralCommands.cs:390-433 | `/nextgame` 群命令 | 群内 | 加入 NotifyGame 等待名单并私聊确认，不建局 | service.py:149-150 | test_nextgame_subscribes_wait_list_instead_of_creating_room | `/nextgame`（群 u1 无局） | 被映射为建局（房间创建） | 已差异 | Q-DIFF-05 | 2026-09-01 |
 | Q-033 | GameCommands.cs:189-218 | `/stopwaiting` | 群内/等待名单 | DeletedFromWaitList 发到用户私聊 | service.py:178-179 | test_stopwaiting_confirms_in_private_chat | `/stopwaiting`（群 u1） | “已停止接收本群的等待通知”回在群里 | 已差异 | Q-DIFF-06 | 2026-09-01 |
-| Q-034 | Werewolf.cs:4950-4966 + HandleReply:930-933 | 白天投票（/vote） | 投票期 | 官方回调选人后 CurrentQuestion 清空，票固定 | service.py:249-254 / engine.py:2411-2438 | test_vote_success_and_no_revote | `/vote 2` 后 `/vote 3`（u1） | “投票已记录”；再次“已经投过票”，票未变 | 已通过 | - | 2026-09-01 |
+| Q-034 | Werewolf.cs:4950-4966 + HandleReply:930-933 | 白天投票（/vote） | 投票期 | 官方回调选人后 CurrentQuestion 清空，票固定 | service.py:249-254 / engine.py:2411-2438 | test_vote_success_and_no_revote | `/vote 2` 后 `/vote 3`（u1） | “1号 … 投票将 2号 … 处死。”（群内公开）；再次“已经投过票”，票未变 | 已通过 | - | 2026-09-01 |
 | Q-035 | UpdateHandler.cs:336-372 | 投票非法目标 | 投票期 | 菜单无非法目标；文字需拦截并提示座位号 | engine.py:130-140 | test_vote_invalid_seat_prompts_seat_usage | `/vote 99`（u1） | “找不到目标座位” | 已通过 | - | 2026-09-01 |
 | Q-036 | Werewolf.cs:4950-4966 | 投票无目标 | 投票期 | 无“空投票”入口，未选择不算投票 | engine.py:2419-2422 | test_vote_without_target_does_not_consume_the_vote | `/vote`（u1）再 `/vote 2` | `/vote` 被当作弃票记录，随后再投被拒 | 已差异 | Q-DIFF-07 | 2026-09-01 |
 | Q-037 | Werewolf.cs:4950-4966 | 投票自己 | 投票期 | 候选列表排除自己 | engine.py:139-140 | test_vote_self_rejected_like_official_menu | `/vote 1`（u1=座位1） | “不能选择自己” | 已通过 | - | 2026-09-01 |
 | Q-038 | Werewolf.cs:4950-4966 | 投票（死人） | 投票期 | 只给存活玩家发菜单 | engine.py:2415-2416 | test_vote_by_dead_player_rejected | 死亡 u1 `/vote 2` | “出局玩家不能投票” | 已通过 | - | 2026-09-01 |
 | Q-039 | handle_reply 阶段检查 | 投票错误阶段 | 非投票期 | 无投票菜单 | engine.py:2412-2413 | test_vote_wrong_phase_rejected | 夜晚局 `/vote 2`（u3） | “现在不是投票阶段” | 已通过 | - | 2026-09-01 |
-| Q-040 | 见总表分片 P-008 | 弃票（/vote abstain、弃票、跳过、/abstain） | 投票期 | 淘汰主循环按闲置计（弃票等价于不投） | engine.py:2420-2422 | test_abstain_and_skip_record_non_vote | `弃票`/`跳过`/`/vote abstain`（u1/u2/u3） | “投票已记录”，votes 记录为 None | 已通过 | - | 2026-09-01 |
+| Q-040 | 见总表分片 P-008 | 弃票（/vote abstain、弃票、跳过、/abstain） | 投票期 | 淘汰主循环按闲置计（弃票等价于不投） | engine.py:2420-2422 | test_abstain_and_skip_record_non_vote | `弃票`/`跳过`/`/vote abstain`（u1/u2/u3） | “1号 … 选择弃票。”（群内公开），votes 记录为 None | 已通过 | - | 2026-09-01 |
 | Q-041 | application/commands.py:13-146（别名表缺失） | `/abstain` | 投票期 | QQ 版无此入口 | commands.py:149-168 | test_bare_abstain_slash_command_falls_back_to_help | `/abstain`（群 u1） | “未识别命令 + /startgame 引导”（提示层差异，见展示差异） | 已通过 | - | 2026-09-01 |
 | Q-042 | Werewolf.cs:4950-4966 | 改票 | 投票期 | 官方无改票回调 | engine.py:2417-2418, service.py:280-281 | test_change_vote_rejected_like_official | `/vote 2` 后 `改票 3` | “官方规则投票后不可改票” | 已通过 | - | 2026-09-01 |
 | Q-043 | HandleReply:995-1156 | 夜间私聊（/查验） | 夜晚 | 回调只记录一次；再点无效且结果不变 | engine.py:517-592 | test_night_seer_private_action_success_and_repeat_rejected | C2C `/查验 3` 后 `/查验 4`（u1 预言家） | “行动已记录”，target 不变；再次“该夜间行动已经提交” | 已通过 | - | 2026-09-01 |
@@ -68,8 +70,8 @@
 | Q-051 | Werewolf.cs SendNightActions | 白天能力在群里 | 白天 | 只在 PM 菜单 | service.py:271-274 | test_day_ability_in_group_redirected_to_private | 群 `/开枪 2` | “私聊”引导 | 已通过 | - | 2026-09-01 |
 | Q-052 | HandleReply:899-909 | 市长 reveal（确认式） | 白天/投票 | Reveal 按钮 → 文字“确认” | service.py:304-389 | test_mayor_confirm_only_flow_via_text | C2C `/mayor`→`确认` | “发送确认使用”→“公开市长身份”，vote_weight=2 | 已通过 | - | 2026-09-01 |
 | Q-053 | UpdateHandler.cs:336-372 | 未识别输入 | 任何 | Telegram 静默忽略非命令；QQ 需引导可用斜杠指令 | service.py:146-147 | test_unknown_group_text_returns_command_help | 群“随便说点什么” | “未识别命令”+含 /startgame 帮助 | 已通过 | - | 2026-09-01 |
-| Q-054 | UpdateHandler.cs:336-372 | 仅 @提及机器人 | 群 | 无命令则引导 | service.py:146-147,150-154 | test_mention_only_message_returns_help | `<@!bot-openid-1>` | 含 /startgame 帮助 | 已通过 | - | 2026-09-01 |
-| Q-055 | HandleReply | 身份查询（/身份） | 私聊 | 私聊身份值 | service.py:202-207 | test_identity_query_in_private_returns_role | C2C `/身份`（u1 预言家） | “你的身份是【Seer】”（英文枚举值，中文化见展示差异） | 已通过 | - | 2026-09-01 |
+| Q-054 | UpdateHandler.cs:336-372 | 仅 @提及机器人 | 群 | 无命令则引导 | service.py:146-147,150-154 | test_mention_only_message_returns_help | `[CQ:at,qq=10000]` | 含 /startgame 帮助 | 已通过 | - | 2026-09-01 |
+| Q-055 | HandleReply | 身份查询（/身份） | 私聊 | 私聊身份值 | service.py:517 | test_identity_query_in_private_returns_role | C2C `/身份`（u1 预言家） | 通过 `role_display_name` 输出简体中文身份名 | 已通过 | - | 2026-09-05 |
 | Q-056 | application/commands.py:150-151 | 重复空格/多个@提及 | 群 | 解析稳定命中同一条命令 | commands.py:149-168 | test_parse_command_tolerates_repeated_spaces_and_mentions | `<@!b> <@!b2> /players`、`/vote    3` | 均正确解析为对应 command | 已通过 | - | 2026-09-01 |
 | Q-057 | 事件去重（application/service.py:83-89） | 同一事件号重推 | 群 | Telegram 不会重复；QQ 需幂等 | service.py:83-102 | test_startgame_duplicate_event_id_replays_cached_result | 同一 `fixed-start-1` 事件 `/startgame` 两次 | 第二次返回缓存，只提交一次 | 已通过 | - | 2026-09-01 |
 
@@ -111,11 +113,10 @@ Telegram 按钮/动图/语言包/成就/QQ 菜单外观不在本分片计入玩�
 | 处决选人菜单 | 内联按钮 | `弃票` `跳过` `/vote abstain` | vote（推断为 None） | `空投`语义差异见 Q-DIFF-07 |
 | `/abstain` | 无（官方弃票靠内联“跳过”） | `/abstain` | 未映射（落回帮助/`弃票`） | 仅提示层差异，见 Q-041 |
 | 夜间/白天能力按钮 | 内联按钮（PM） | `/狼人` `/查验` `/守护` `/开枪` 等 + 座位号 + `确认` `重选` `取消` | 各 role 指令 + step_action | C2C/DIRECT 私聊 |
-| 身份展示 | 私聊文本 | `/身份` | identity | 角色名当前显示官方英文枚举值（Seer 而非 预言家），中文化待展示层 |
+| 身份展示 | 私聊文本 | `/身份` | identity | 通过 `role_display_name` 输出简体中文身份名，缺失时回退枚举值 |
 | 面板指令集 | QQ 命令面板 | `/help` `/stats` `/rolelist` `/config` `/ping` 等 | 见面板 _GROUP_PANEL_ITEMS | 仅外观 |
 
 ## 复查说明
 
-- 全量 `python -m pytest -q` → `286 passed + 8 xfailed（strict）`，无失败、无跳过。
-- 分片 `python -m pytest tests/test_audit_qq_commands.py -q` → `48 passed + 8 xfailed（strict）`。
+- 分片 `python -m pytest tests/test_audit_qq_commands.py -q` → `63 passed`；全量 `621 passed`。
 - 未改动 `domain/`、`application/`、`adapters/`、`infrastructure/` 及 `test_official_parity.py`、`test_parity.py`、`test_adapter_and_commands.py`、`conftest.py`、`docs/official-branch-ledger.md`。

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from adapters.qq.adapter import QQBotAdapter
+from adapters.napcat.adapter import NapCatAdapter
 from adapters.web.dashboard import setup_dashboard
 from application.service import GameApplication
 from infrastructure.config import Settings
@@ -54,9 +54,14 @@ class Runtime:
             admin_user_ids=settings.admin_user_ids,
             dev_user_ids=settings.dev_user_ids,
         )
-        self.adapter = QQBotAdapter(
-            settings.app_id, settings.app_secret, self.application, store=self.store
+        self.adapter = NapCatAdapter(
+            settings.napcat_ws_url,
+            settings.napcat_access_token,
+            self.application,
+            store=self.store,
         )
+        # 群名片改写、群成员昵称查询等平台能力由适配器提供，注入给应用层使用。
+        self.application.bind_platform(self.adapter)
         self.queue_limit = 1000
         self._stop = asyncio.Event()
 
@@ -100,7 +105,7 @@ class Runtime:
         await site.start()
         log.info(
             "服务已启动",
-            extra={"session_id": self.settings.app_id_masked},
+            extra={"session_id": self.settings.napcat_endpoint_masked},
         )
         log.info(
             "后台实时观测页地址：http://%s:%s/dashboard",
@@ -127,7 +132,7 @@ async def migrate(settings: Settings) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="狼人杀 QQ 官方机器人")
+    parser = argparse.ArgumentParser(description="狼人杀 QQ 机器人（NapCat / OneBot 11）")
     parser.add_argument("command", nargs="?", choices=("run", "migrate"), default="run")
     return parser
 

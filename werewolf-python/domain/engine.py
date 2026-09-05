@@ -19,9 +19,9 @@ from .models import (
     NightAction,
     Player,
     QuestionType,
-    qq_short_id,
     RandomSource,
     ROLE_ACTIONS,
+    ROLE_TEAM,
     DAY_ACTIONS,
     MAJORITY_WOLF_ROLES,
     OFFICIAL_MAX_JOIN_TIME,
@@ -30,7 +30,7 @@ from .models import (
     Team,
     WOLF_ROLES,
 )
-from .rules import assign_official_roles
+from .rules import GameRuleError, assign_official_roles
 from .roleinfo import role_display_name
 from .achievements import (
     Achievement,
@@ -38,10 +38,6 @@ from .achievements import (
     achievement_name,
     unlock_text,
 )
-
-
-class GameRuleError(ValueError):
-    pass
 
 
 _SKIP = {"", "跳过", "弃权", "弃票", "skip", "abstain", "-1", "0"}
@@ -422,7 +418,7 @@ class GameRoomEngine:
                 if value == player.user_id
                 or folded == player.display_name.casefold()
                 or folded == player.public_name.casefold()
-                or folded == player.list_label.casefold()
+                or folded == player.short_label.casefold()
             ),
             None,
         )
@@ -476,7 +472,6 @@ class GameRoomEngine:
         room: GameRoom,
         user_id: str,
         display_name: str,
-        qq_number: str | None = None,
     ) -> list[DomainEvent]:
         if room.phase != GamePhase.LOBBY:
             return []
@@ -497,7 +492,6 @@ class GameRoomEngine:
                 user_id=user_id,
                 display_name=cleaned_name,
                 seat=len(room.players) + 1,
-                qq_number=qq_number,
             )
         )
         # 建局者可能没有立刻 /join；第一个真正入场的玩家兜底成为房主，
@@ -521,12 +515,11 @@ class GameRoomEngine:
         # 玩家侧最常见的卡点是“人齐了却不知道怎么开”，所以直接把指令写进播报。
         suffix = "现在可以开始，房主发送 /startgame 立即开局。" if not needed else f"还需 {needed} 人。"
         player = room.players[-1]
-        # QQ 群消息经常没有昵称，display_name 会落成 32 位 openid；群里回复已经 @ 了对方，不再把 ID 打进正文。
         shown_name = player.public_name
         # Werewolf.cs:456-459 —— ShowIDs 群设置会在加入播报中附带玩家 ID。
-        # 但整串 openid 属于内部标识，只给 8 位短码用于人工比对。
+        # NapCat 下这就是真实 QQ 号，本来就是群内公开信息，可以直接展示。
         if room.rules.show_ids:
-            shown_name = f"{shown_name}（内部号{qq_short_id(user_id)}）"
+            shown_name = f"{shown_name}（QQ {user_id}）"
         return [DomainEvent("player_joined", f"{shown_name} 加入游戏，当前 {len(room.players)} 人。{suffix}")]
 
     def _reassign_host(self, room: GameRoom, leaving_user_id: str) -> None:
@@ -813,11 +806,20 @@ class GameRoomEngine:
                 extras.append("狼人同伴：" + "、".join(item.public_name for item in wolves) + "。")
             if player.role == Role.CULTIST and len(cultists) > 1:
                 extras.append("教会同伴：" + "、".join(item.public_name for item in cultists) + "。")
-            suffix = (" " + "".join(extras)) if extras else ""
+            # 阵营按「看到的身份」算：愚者以为自己是预言家，就得跟着当村民，
+            # 否则这条私聊本身就把他的真实身份漏了。
+            shown_team = ROLE_TEAM.get(shown) if shown else None
+            lines = [
+                f"你的身份：{role_display_name(shown) if shown else '未知'}"
+                f"｜阵营：{self._team_text(shown_team) if shown_team else '未知'}",
+                f"目标：{self._team_goal(shown_team)}",
+                f"操作：{self._role_help(shown)}",
+            ]
+            lines.extend(extras)
             events.append(
                 DomainEvent(
                     "identity",
-                    f"你的身份是【{role_display_name(shown) if shown else '未知'}】。{self._role_help(player.role)}{suffix}",
+                    "\n".join(lines),
                     public=False,
                     target_user_id=player.user_id,
                     metadata={
@@ -831,6 +833,24 @@ class GameRoomEngine:
                 )
             )
         return events
+
+    @staticmethod
+    def _team_goal(team: Team | None) -> str:
+        """一句话讲清这个阵营怎么算赢。
+
+        对局一开始玩家只拿到一个角色名，光有技能说明还是不知道该往哪打，
+        所以身份私聊里把胜利条件也一并给出（用户需求第七条）。
+        """
+        return {
+            Team.VILLAGE: "找出并票死所有狼人、教徒与中立杀手，让村庄活到最后。",
+            Team.WOLF: "夜里袭击、白天藏住自己，把狼人数量拖到不少于其余存活玩家即获胜。",
+            Team.CULT: "靠转化把所有存活玩家都发展成教徒即获胜。",
+            Team.TANNER: "你只有被村民投票处决才算赢，其他任何结局都算输。",
+            Team.SERIAL_KILLER: "独自把其他人杀光，活到最后即获胜。",
+            Team.ARSONIST: "先浇油标记，再一把火点燃，成为最后的幸存者即获胜。",
+            Team.LOVERS: "和恋人一起活到只剩你们两人即获胜，阵营已不再重要。",
+            Team.THIEF: "偷到想要的身份，并以那个身份的目标继续这局。",
+        }.get(team, "按你的角色说明达成自己的目标，具体胜负条件见 /rolelist。")
 
     def _assign_roles(self, room: GameRoom) -> None:
         assignment = assign_official_roles(
@@ -3599,7 +3619,7 @@ class GameRoomEngine:
         # Werewolf.cs:4954 —— SendLynchMenu 每轮开始重置 NoOneCastLynch。
         room.statistics["no_one_cast_lynch"] = True
         room.state_version += 1
-        events.append(DomainEvent("vote_started", f"讨论结束，进入投票阶段（{room.rules.vote_seconds} 秒）。请发送：投票 座位号或弃票。官方规则投票后不可改票。\n{self.public_roster(room)}"))
+        events.append(DomainEvent("vote_started", f"讨论结束，进入投票阶段（{room.rules.vote_seconds} 秒）。请发送：投票 座位号或弃票。官方规则投票后不可改票。\n{self.alive_roster(room)}"))
         return events
 
     def _resolve_day_actions(self, room: GameRoom) -> list[DomainEvent]:
@@ -3843,7 +3863,20 @@ class GameRoomEngine:
                 if voter.first_stone == 5:
                     extra.extend(self._add_achievement(voter, Achievement.FIRST_STONE))
         room.state_version += 1
-        events = [DomainEvent("vote_accepted", "投票已记录。", public=False, target_user_id=user_id)]
+        # Werewolf.cs:1125-1151 —— 领域层保留官方的投票确认契约：
+        # 确认发给投票者本人，由平台适配层决定是否同时在群里播报。
+        choice = room.votes.get(user_id)
+        if room.rules.secret_lynch:
+            text = f"{voter.short_label} 投票了，总计 {len(room.votes)} 票。"
+        elif choice is None:
+            text = f"{voter.short_label} 选择弃票。"
+        else:
+            chosen = next((p for p in room.players if p.user_id == choice), None)
+            name = chosen.short_label if chosen else "未知玩家"
+            text = f"{voter.short_label} 投票将 {name} 处死。"
+        events = [DomainEvent(
+            "vote_accepted", text, public=False, target_user_id=voter.user_id,
+        )]
         events.extend(extra)
         if {p.user_id for p in self._players(room)}.issubset(room.votes):
             events.extend(self.resolve_vote(room))
@@ -4054,7 +4087,7 @@ class GameRoomEngine:
             room.state_version += 1
             events.append(DomainEvent(
                 "vote_started",
-                f"捣乱者发动第二轮处决。请再次投票（{room.rules.vote_seconds} 秒）。\n{self.public_roster(room)}",
+                f"捣乱者发动第二轮处决。请再次投票（{room.rules.vote_seconds} 秒）。\n{self.alive_roster(room)}",
             ))
             return events
         room.statistics.pop("lynch_attempt", None)
@@ -4446,9 +4479,21 @@ class GameRoomEngine:
     @staticmethod
     def public_roster(room: GameRoom) -> str:
         return "玩家：" + "、".join(
-            f"{p.list_label}{'' if p.alive else '（出局）'}"
+            f"{p.short_label}{'' if p.alive else '（出局）'}"
             for p in room.players
         )
+
+    @staticmethod
+    def alive_roster(room: GameRoom) -> str:
+        """投票阶段用的存活名单。
+
+        只列还活着的人，每人一律「号码 + 群昵称」，出局的一个都不出现，
+        免得投票时还要自己在全员名单里剔掉带「（出局）」的那几个。
+        """
+        alive = [p.short_label for p in room.players if p.alive]
+        if not alive:
+            return "本局存活玩家：无"
+        return "本局存活玩家：" + "、".join(alive)
 
     def on_timeout(self, room: GameRoom) -> list[DomainEvent]:
         # 猎人临终一枪窗口优先于阶段计时器：官方期间整局流程被阻塞。

@@ -16,7 +16,7 @@ import itertools
 
 import pytest
 
-from adapters.qq.events import normalize_c2c_message, normalize_group_message
+from adapters.napcat.events import normalize_group_message, normalize_private_message
 from application.commands import parse_command
 from application.contracts import PlatformEvent, SessionType
 from application.service import GameApplication
@@ -75,9 +75,6 @@ class AuditStore:
             if any(p.user_id == user_id for p in room.players)
         ]
 
-    async def get_direct_session(self, _user_id):
-        return None
-
     async def get_group_rule_config(self, _group_id):
         return {}
 
@@ -87,22 +84,26 @@ def make_app(rooms=(), admins=()):
     return GameApplication(store, admin_user_ids=admins), store
 
 
-def group_event(content, *, user="u1", name=None, group="g1", event_id=None) -> PlatformEvent:
+def group_event(content, *, user="u1", name=None, group="g1", event_id=None, role="member") -> PlatformEvent:
     return normalize_group_message({
-        "id": event_id or f"evt-{next(_ids)}",
-        "group_openid": group,
-        "content": content,
-        "timestamp": "2026-09-01T00:00:00+00:00",
-        "author": {"member_openid": user, "username": name or f"玩家{user}"},
+        "message_id": event_id or f"evt-{next(_ids)}",
+        "group_id": group,
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": 1767225600,
+        "sender": {"user_id": user, "nickname": name or f"玩家{user}", "role": role},
     })
 
 
 def c2c_event(content, *, user="u1", name=None, event_id=None) -> PlatformEvent:
-    return normalize_c2c_message({
-        "id": event_id or f"evt-{next(_ids)}",
-        "content": content,
-        "timestamp": "2026-09-01T00:00:00+00:00",
-        "author": {"user_openid": user, "username": name or f"玩家{user}"},
+    return normalize_private_message({
+        "message_id": event_id or f"evt-{next(_ids)}",
+        "user_id": user,
+        "raw_message": content,
+        "message": [{"type": "text", "data": {"text": content}}],
+        "time": 1767225600,
+        "sender": {"user_id": user, "nickname": name or f"玩家{user}"},
     })
 
 
@@ -213,11 +214,14 @@ def test_join_success_then_repeat_join_is_silent():
 
 
 def test_join_with_bot_mention_and_extra_spaces_still_joins():
-    """QQ 群 @机器人 时 content 带 <@!openid> 与多余空格，解析必须命中同一流程。"""
+    """群里带 @机器人 的 CQ 码与多余空格，解析必须命中同一流程。
+
+    NapCat 版不再要求 @Bot 才触发，但玩家习惯性 @ 一下也不能把指令打乱。
+    """
     app, store = make_app()
     run(app.handle_event(group_event("/startgame", user="u1")))
     messages = run(app.handle_event(
-        group_event("<@!bot-openid-1>   /join   ", user="u2", name="乙")
+        group_event("[CQ:at,qq=10000]   /join   ", user="u2", name="乙")
     ))
     assert "加入游戏" in texts(messages)
     assert any(p.user_id == "u2" for p in store.rooms["g1"].players)
@@ -297,6 +301,16 @@ def test_forcestart_admin_starts_immediately_without_timer():
     assert store.rooms["g1"].phase == GamePhase.NIGHT
     # 已经开局，定时器循环不应再重复处理这间房。
     assert run(app.process_due_rooms()) == 0
+
+
+def test_group_owner_role_is_recognized_without_static_whitelist():
+    """NapCat sender.role 提供群主权限时，不必重复配置 ADMIN_USER_IDS。"""
+    room = lobby_room(count=5)
+    room.host_user_id = "u1"
+    app, store = make_app(rooms=[room])
+    messages = run(app.handle_event(group_event("/forcestart", user="admin", role="owner")))
+    assert "游戏开始" in texts(messages)
+    assert store.rooms["g1"].phase == GamePhase.NIGHT
 
 
 def test_forcestart_with_too_few_players_reports_shortage():
@@ -502,7 +516,9 @@ def test_vote_success_and_no_revote():
     room = vote_room()
     app, store = make_app(rooms=[room])
     first = run(app.handle_event(group_event("/vote 2", user="u1")))
-    assert "投票已记录" in texts(first)
+    # Werewolf.cs:1125-1151 —— 非秘密投票公开播报「谁投了谁」，发到群里而不是私聊。
+    assert "投票将 2号" in texts(first)
+    assert all(m.target.session_type == SessionType.GROUP for m in first)
     target_id = store.rooms["g1"].votes["u1"]
     second = run(app.handle_event(group_event("/vote 3", user="u1")))
     assert "已经投过票" in texts(second)
@@ -522,7 +538,7 @@ def test_vote_without_target_does_not_consume_the_vote():
     run(app.handle_event(group_event("/vote", user="u1")))
     # 官方期望：没有选择目标不算投票，玩家仍可继续投票。
     messages = run(app.handle_event(group_event("/vote 2", user="u1")))
-    assert "投票已记录" in texts(messages)
+    assert "投票将 2号" in texts(messages)
     assert store.rooms["g1"].votes["u1"] == "u2"
 
 
@@ -558,13 +574,13 @@ def test_abstain_and_skip_record_non_vote():
     room = vote_room()
     app, store = make_app(rooms=[room])
     first = run(app.handle_event(group_event("弃票", user="u1")))
-    assert "投票已记录" in texts(first)
+    assert "选择弃票" in texts(first)
     assert store.rooms["g1"].votes["u1"] is None
     second = run(app.handle_event(group_event("跳过", user="u2")))
-    assert "投票已记录" in texts(second)
+    assert "选择弃票" in texts(second)
     assert store.rooms["g1"].votes["u2"] is None
     third = run(app.handle_event(group_event("/vote abstain", user="u3")))
-    assert "投票已记录" in texts(third)
+    assert "选择弃票" in texts(third)
     assert store.rooms["g1"].votes["u3"] is None
 
 
@@ -573,7 +589,7 @@ def test_bare_abstain_slash_command_records_non_vote():
     room = vote_room()
     app, store = make_app(rooms=[room])
     messages = run(app.handle_event(group_event("/abstain", user="u1")))
-    assert "投票已记录" in texts(messages)
+    assert "选择弃票" in texts(messages)
     assert store.rooms["g1"].votes["u1"] is None
 
 
@@ -704,7 +720,7 @@ def test_mayor_confirm_only_flow_via_text():
 # ---------------------------------------------------------------------------
 
 def test_unknown_group_text_returns_command_help():
-    """QQ @机器人 的乱输入必须引导到可用斜杠指令（官方 Telegram 直接忽略非命令）。"""
+    """群里的乱输入必须引导到可用斜杠指令（官方 Telegram 直接忽略非命令）。"""
     app, _ = make_app()
     messages = run(app.handle_event(group_event("随便说点什么", user="u1")))
     text = texts(messages)
@@ -714,7 +730,7 @@ def test_unknown_group_text_returns_command_help():
 
 def test_mention_only_message_returns_help():
     app, _ = make_app()
-    messages = run(app.handle_event(group_event("<@!bot-openid-1>", user="u1")))
+    messages = run(app.handle_event(group_event("[CQ:at,qq=10000]", user="u1")))
     assert "/startgame" in texts(messages)
 
 
@@ -723,6 +739,15 @@ def test_identity_query_in_private_returns_role():
     app, _ = make_app(rooms=[room])
     messages = run(app.handle_event(c2c_event("/身份", user="u1")))
     # 官方私聊身份提示用本地化角色名（如「👳 先知」），不是枚举英文值。
+    assert f"你的身份是【{role_display_name(Role.SEER)}】" in texts(messages)
+
+
+def test_identity_query_prefers_active_room_over_history():
+    historical = night_room(session_id="old")
+    historical.phase = GamePhase.FINISHED
+    active = night_room(session_id="g1")
+    app, _ = make_app(rooms=[historical, active])
+    messages = run(app.handle_event(c2c_event("/身份", user="u1")))
     assert f"你的身份是【{role_display_name(Role.SEER)}】" in texts(messages)
 
 
